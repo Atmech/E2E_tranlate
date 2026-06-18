@@ -24,13 +24,22 @@ net.createServer((tcp) => {
   console.log('[relay] asterisk connected');
   const ws = new WebSocket(wsUrl);
 
-  ws.on('open', () => console.log('[relay] ws open'));
+  // Asterisk sends the UUID frame the instant it connects, but the WS handshake to a
+  // remote bridge isn't open yet. Buffer everything until the WS opens, then flush in
+  // order — otherwise the UUID frame is lost and the bridge never registers the call.
+  const queue = [];
+  ws.on('open', () => {
+    console.log('[relay] ws open');
+    for (const chunk of queue) ws.send(chunk, { binary: true });
+    queue.length = 0;
+  });
   ws.on('error', (e) => { console.error('[relay] ws error:', e.message); tcp.destroy(); });
   ws.on('close', () => { console.log('[relay] ws closed'); tcp.destroy(); });
 
-  // Asterisk → bridge
+  // Asterisk → bridge (queue until WS open, then stream)
   tcp.on('data', (chunk) => {
     if (ws.readyState === WebSocket.OPEN) ws.send(chunk, { binary: true });
+    else queue.push(chunk);
   });
 
   // bridge → Asterisk

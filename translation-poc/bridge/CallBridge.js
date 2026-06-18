@@ -46,11 +46,18 @@ export class CallBridge {
 
   attachAgent(ws) {
     this.agentWs = ws;
+    // Reset PTT on (re)attach: a browser reconnect can leave agentTalking stuck true
+    // (missed mouseup before the socket dropped), which silently mutes the customer leg.
+    this.agentTalking = false;
     console.log(`[bridge ${this.callId}] agent attached`);
     this.sendUi({ type: 'config', agentLang: AGENT_LANG, customerLang: CUSTOMER_LANG });
     this.sendUi({ type: 'call', state: 'connected' });
   }
-  detachAgent() { if (this.agentWs) console.log(`[bridge ${this.callId}] agent detached`); this.agentWs = null; }
+  detachAgent() {
+    if (this.agentWs) console.log(`[bridge ${this.callId}] agent detached`);
+    this.agentWs = null;
+    this.agentTalking = false; // never leave the customer leg muted with no agent attached
+  }
 
   sendUi(obj) {
     const ws = this.agentWs;
