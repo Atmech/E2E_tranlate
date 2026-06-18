@@ -105,7 +105,10 @@ const httpServer = http.createServer((req, res) => {
 });
 
 // ---- WS /agent (browser) ----
-const wss = new WebSocketServer({ server: httpServer, path: AGENT_WS_PATH });
+// Both WS servers share one HTTP server, so use noServer + a single upgrade router.
+// (Attaching multiple WebSocketServer({server,path}) makes the first one 400 every
+//  upgrade whose path it doesn't own, before the second can handle it.)
+const wss = new WebSocketServer({ noServer: true });
 wss.on('connection', (ws) => {
   console.log('[agent] connected');
   agents.add(ws);
@@ -144,7 +147,19 @@ wss.on('connection', (ws) => {
 
 // ---- WS /audiosocket (relay.js connects here instead of raw TCP) ----
 // Wraps each WS connection in a socket-like shim so CallBridge sees the same interface.
-const asWss = new WebSocketServer({ server: httpServer, path: AS_WS_PATH });
+const asWss = new WebSocketServer({ noServer: true });
+
+// Single upgrade handler routes by pathname to the right WS server.
+httpServer.on('upgrade', (req, socket, head) => {
+  const { pathname } = new URL(req.url, 'http://localhost');
+  if (pathname === AGENT_WS_PATH) {
+    wss.handleUpgrade(req, socket, head, (ws) => wss.emit('connection', ws, req));
+  } else if (pathname === AS_WS_PATH) {
+    asWss.handleUpgrade(req, socket, head, (ws) => asWss.emit('connection', ws, req));
+  } else {
+    socket.destroy();
+  }
+});
 asWss.on('connection', (ws) => {
   let bridge = null;
   let callId = null;
