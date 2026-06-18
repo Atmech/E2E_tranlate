@@ -155,7 +155,7 @@ footer {
 
 <footer>
   <div class="footer-top">
-    <input id="url" value="ws://localhost:8080/agent" />
+    <input id="url" />
     <button class="btn-start" id="start">Start mic</button>
     <button class="btn-stop"  id="stop" disabled>Stop</button>
     <div class="mic-wrap"><div class="mic-fill" id="mic-meter"></div></div>
@@ -170,6 +170,10 @@ footer {
 
 <script type="module">
 const $ = (id) => document.getElementById(id);
+
+// Auto-derive WS URL from current page host so it works on Render and locally.
+const wsProto = location.protocol === 'https:' ? 'wss' : 'ws';
+$('url').value = `${wsProto}://${location.host}/agent`;
 
 // ── Audio pipeline state (carry-over, untouched) ──
 let ws = null, capCtx = null, playCtx = null, workletNode = null, micStream = null;
