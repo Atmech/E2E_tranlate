@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: e2e-translate-bridge
+    runtime: node
+    rootDir: translation-poc
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: AGENT_LANG
+        value: hi
+      - key: CUSTOMER_LANG
+        value: en

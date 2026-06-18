@@ -1,0 +1,21 @@
+# Asterisk (with AudioSocket) for the translation POC.
+# AudioSocket needs Asterisk 18+. The container reaches the Node bridge on the Mac host
+# via host.docker.internal:9092 (see extensions.conf).
+#
+# NOTE: config mount paths vary by image. mlan/docker-asterisk reads /etc/asterisk.
+# Verify res_audiosocket + app_audiosocket are present after boot:
+#   docker compose exec asterisk asterisk -x "module show like audiosocket"
+services:
+  asterisk:
+    image: andrius/asterisk:latest
+    container_name: translation-asterisk
+    restart: unless-stopped
+    # extra_hosts makes host.docker.internal resolve on Linux hosts too (no-op on Mac).
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "5060:5060/udp"          # SIP signaling
+      - "10000-10100:10000-10100/udp"   # RTP media
+    volumes:
+      - ./pjsip.conf:/etc/asterisk/pjsip.conf:ro
+      - ./extensions.conf:/etc/asterisk/extensions.conf:ro
