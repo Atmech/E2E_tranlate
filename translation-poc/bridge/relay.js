@@ -22,6 +22,7 @@ console.log(`relay: TCP :${TCP_PORT} → ${wsUrl}`);
 
 net.createServer((tcp) => {
   console.log('[relay] asterisk connected');
+  tcp.setNoDelay(true); // disable Nagle: send each 20ms audio frame immediately, no coalescing wait
   const ws = new WebSocket(wsUrl);
 
   // Asterisk sends the UUID frame the instant it connects, but the WS handshake to a

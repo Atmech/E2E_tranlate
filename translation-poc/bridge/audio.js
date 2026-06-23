@@ -31,17 +31,22 @@ export function b64ToInt16(b64) {
   return bufToInt16(buf);
 }
 
-// AudioSocket payload is signed 16-bit LITTLE-ENDIAN. Convert explicitly so this is
-// correct regardless of host endianness and Buffer byte-offset alignment.
+// AudioSocket payload is signed 16-bit LITTLE-ENDIAN (x86/arm hosts are LE, so a typed-array
+// view is correct). Zero-copy view when the buffer is 2-byte aligned; fall back to the safe
+// per-sample copy on the rare odd byteOffset (pooled Buffer slices). Result is consumed
+// synchronously by the resampler, so sharing memory with the source Buffer is safe.
 export function bufToInt16(buf) {
+  if ((buf.byteOffset & 1) === 0) {
+    return new Int16Array(buf.buffer, buf.byteOffset, buf.length >> 1);
+  }
   const n = buf.length >> 1;
   const out = new Int16Array(n);
   for (let i = 0; i < n; i++) out[i] = buf.readInt16LE(i * 2);
   return out;
 }
 
+// Zero-copy view over the Int16Array's bytes (host is LE). Caller passes a fresh array
+// (resampler output), so the returned Buffer never outlives a mutation of its source.
 export function int16ToBuf(i16) {
-  const buf = Buffer.allocUnsafe(i16.length * 2);
-  for (let i = 0; i < i16.length; i++) buf.writeInt16LE(i16[i], i * 2);
-  return buf;
+  return Buffer.from(i16.buffer, i16.byteOffset, i16.byteLength);
 }

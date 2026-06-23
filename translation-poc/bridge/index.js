@@ -30,6 +30,7 @@ const agents = new Set();      // currently connected agent WS sockets
 
 // ---- AudioSocket TCP server (Asterisk connects here) ----
 const tcp = net.createServer((sock) => {
+  sock.setNoDelay(true); // disable Nagle: forward each 20ms audio frame without coalescing delay
   let bridge = null;
   let callId = null;
 

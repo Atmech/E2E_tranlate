@@ -6,15 +6,29 @@ import { int16ToB64 } from './audio.js';
 const API_KEY = process.env.GEMINI_API_KEY;
 const MODEL = process.env.GEMINI_LIVE_MODEL || 'gemini-3.5-live-translate-preview';
 
-// Gemini wants ~100ms chunks; 1600 samples @ 16kHz.
-const CHUNK_SAMPLES = 1600;
+// Chunk sent to Gemini. 1600 = 100ms (old default) added up to 100ms of buffering before
+// audio even reached the model. The Live API accepts smaller chunks; 320 = 20ms (1:1 with
+// the AudioSocket frame) cuts that buffering to ~20ms. If turn detection gets flaky on
+// dialectal/phone audio, bump GEMINI_CHUNK_SAMPLES to 640 (40ms).
+const CHUNK_SAMPLES = Number(process.env.GEMINI_CHUNK_SAMPLES || 320);
 
 const ai = new GoogleGenAI({ apiKey: API_KEY });
 
+// BCP-47 code -> human name, so the systemInstruction prompt is unambiguous about the
+// SOURCE language (the dedicated translate model auto-detects and can mis-detect dialectal
+// phone audio; the general model lets us pin both directions explicitly).
+const LANG_NAMES = {
+  en: 'English', hi: 'Hindi', ar: 'Arabic', es: 'Spanish', fr: 'French', de: 'German',
+  pt: 'Portuguese', ru: 'Russian', it: 'Italian', zh: 'Chinese', ja: 'Japanese',
+  ko: 'Korean', tr: 'Turkish', ur: 'Urdu', bn: 'Bengali',
+};
+const langName = (code) => LANG_NAMES[code] || code;
+
 export class Translator {
   // onAudio(Int16Array@24k), onInputText(str), onOutputText(str), onTurnEnd()
-  constructor(targetLang, { onAudio, onInputText, onOutputText, onTurnEnd } = {}) {
+  constructor(targetLang, { sourceLang, onAudio, onInputText, onOutputText, onTurnEnd } = {}) {
     this.targetLang = targetLang;
+    this.sourceLang = sourceLang || null;
     this.onAudio = onAudio || (() => {});
     this.onInputText = onInputText || (() => {});
     this.onOutputText = onOutputText || (() => {});
@@ -34,9 +48,11 @@ export class Translator {
     if (isTranslate) {
       config.translationConfig = { targetLanguageCode: this.targetLang, echoTargetLanguage: false };
     } else {
-      // Fallback model: prompt-driven translation.
+      // General model: prompt-driven translation. Pin the source language when known so
+      // the model doesn't mis-detect it (e.g. dialectal Arabic over 8kHz phone audio).
+      const from = this.sourceLang ? `from ${langName(this.sourceLang)} ` : '';
       config.systemInstruction = {
-        parts: [{ text: `You are a simultaneous interpreter. Translate every utterance you hear into ${this.targetLang} and speak only the translation. No commentary, no repetition of the source.` }],
+        parts: [{ text: `You are a simultaneous interpreter. The speaker talks ${from}and you translate every utterance into ${langName(this.targetLang)}. Speak only the ${langName(this.targetLang)} translation — no commentary, no repetition of the source, never switch to any other language.` }],
       };
     }
     return config;
@@ -64,10 +80,10 @@ export class Translator {
     for (const part of parts) {
       const data = part.inlineData?.data;
       if (!data) continue;
-      // Gemini audio out = PCM 16-bit LE 24kHz.
+      // Gemini audio out = PCM 16-bit LE 24kHz. Zero-copy view (Buffer.from(base64) is a
+      // fresh, 2-byte-aligned allocation), consumed synchronously by onAudio — no per-sample loop.
       const buf = Buffer.from(data, 'base64');
-      const i16 = new Int16Array(buf.length >> 1);
-      for (let i = 0; i < i16.length; i++) i16[i] = buf.readInt16LE(i * 2);
+      const i16 = new Int16Array(buf.buffer, buf.byteOffset, buf.length >> 1);
       this.onAudio(i16);
     }
     // End of a model turn: all audio for this utterance has been delivered.
