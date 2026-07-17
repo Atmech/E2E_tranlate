@@ -218,25 +218,44 @@ function getBubble(side) {
   return activeAgentBubble;
 }
 
+// The translate model streams continuously and rarely emits a turnComplete on a live
+// (never-silent) phone call, so we can't rely on turn-end alone to split bubbles. Finalize
+// a side's bubble after a short gap with no new transcript for it. turn-end still finalizes
+// immediately when it does fire.
+const BUBBLE_IDLE_MS = 1500;
+const idleTimers = { customer: null, agent: null };
+
+function finalizeBubble(side) {
+  if (side === 'customer') activeCustomerBubble = null;
+  else                     activeAgentBubble = null;
+}
+
+function bumpIdle(side) {
+  if (idleTimers[side]) clearTimeout(idleTimers[side]);
+  idleTimers[side] = setTimeout(() => { idleTimers[side] = null; finalizeBubble(side); }, BUBBLE_IDLE_MS);
+}
+
 function handleTranscript(who, text) {
   hideHint();
-  let bubble, field;
-  if      (who === 'customer')      { bubble = getBubble('customer'); field = 'original'; }
-  else if (who === 'agent-hears')   { bubble = getBubble('customer'); field = 'translation'; }
-  else if (who === 'agent')         { bubble = getBubble('agent');    field = 'original'; }
-  else if (who === 'customer-hears'){ bubble = getBubble('agent');    field = 'translation'; }
+  let bubble, field, side;
+  if      (who === 'customer')      { side = 'customer'; field = 'original'; }
+  else if (who === 'agent-hears')   { side = 'customer'; field = 'translation'; }
+  else if (who === 'agent')         { side = 'agent';    field = 'original'; }
+  else if (who === 'customer-hears'){ side = 'agent';    field = 'translation'; }
   else return;
+  bubble = getBubble(side);
 
   const el = bubble[field];
   el.textContent += text;
   if (field === 'translation') el.style.display = '';
   el.dir = 'auto'; // handles RTL languages automatically
+  bumpIdle(side);  // restart the pause timer that closes this bubble
   $('conv').scrollTop = $('conv').scrollHeight;
 }
 
 function handleTurnEnd(side) {
-  if (side === 'customer') activeCustomerBubble = null;
-  else                     activeAgentBubble = null;
+  if (idleTimers[side]) { clearTimeout(idleTimers[side]); idleTimers[side] = null; }
+  finalizeBubble(side);
 }
 
 // ── Status / timer ──

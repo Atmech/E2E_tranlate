@@ -44,8 +44,13 @@ export function buildHangupFrame() {
 // Paces outbound audio to Asterisk at a steady 20ms cadence. Gemini returns audio in
 // bursts; feeding bursts straight to the channel glitches playback. Accumulate 8kHz PCM
 // bytes, emit exactly one 320-byte 0x10 frame per 20ms tick. Underrun -> skip the tick.
-const END_GAP_MS = 100;                          // silence this long => spurt is over
-const MAX_PREBUFFER_BYTES = BYTES_PER_FRAME * 10; // ~200ms safety fallback
+// Gemini delivers translated audio in bursts, often slower than real-time (esp. Arabic).
+// Draining the instant one frame arrives underruns immediately and chops the audio, so
+// hold a jitter/pre-buffer: don't START a spurt until PREBUFFER_MS is queued, giving
+// delivery a head start to stay ahead of the 20ms playback cadence.
+const PREBUFFER_MS = Number(process.env.PACER_PREBUFFER_MS || 240); // jitter buffer before playback
+const END_GAP_MS = Number(process.env.PACER_END_GAP_MS || 200);     // silence this long => spurt is over
+const PREBUFFER_BYTES = Math.round(PREBUFFER_MS / 20) * BYTES_PER_FRAME;
 const SILENCE_FRAME = Buffer.alloc(BYTES_PER_FRAME); // 20ms of 8kHz silence
 
 export class OutputPacer {
@@ -86,20 +91,22 @@ export class OutputPacer {
   }
 
   _tick() {
-    // Drain immediately — no pre-buffer wait. Emit one 320-byte frame per 20ms tick.
-    // On underrun: emit one silence frame to hold cadence; after END_GAP_MS of silence
-    // treat the spurt as done and stop draining.
+    // Emit one 320-byte frame per 20ms tick. Before a spurt starts, wait until PREBUFFER_BYTES
+    // is queued so bursty, sub-realtime delivery doesn't underrun mid-utterance. Once draining,
+    // on underrun emit a silence frame to hold cadence; after END_GAP_MS of silence the spurt is
+    // over and we re-prebuffer before the next one.
+    if (!this.draining) {
+      if (this.queue.length < PREBUFFER_BYTES) return; // still filling the jitter buffer
+      this.draining = true; this.silenceRun = 0;
+      this._audioFrames = 0; this._silenceFrames = 0; this._spurtStart = Date.now();
+    }
     if (this.queue.length >= BYTES_PER_FRAME) {
-      if (!this.draining) {
-        this.draining = true; this.silenceRun = 0;
-        this._audioFrames = 0; this._silenceFrames = 0; this._spurtStart = Date.now();
-      }
       const frame = this.queue.subarray(0, BYTES_PER_FRAME);
       this.queue = this.queue.subarray(BYTES_PER_FRAME);
       this.silenceRun = 0;
       this._audioFrames++;
       this._write(frame);
-    } else if (this.draining) {
+    } else {
       this.silenceRun++;
       if (this.silenceRun * 20 > END_GAP_MS) {
         this.draining = false;
