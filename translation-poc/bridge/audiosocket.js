@@ -41,97 +41,97 @@ export function buildHangupFrame() {
   return Buffer.from([FRAME.HANGUP, 0x00, 0x00]);
 }
 
-// Paces outbound audio to Asterisk at a steady 20ms cadence. Gemini returns audio in
-// bursts; feeding bursts straight to the channel glitches playback. Accumulate 8kHz PCM
-// bytes, emit exactly one 320-byte 0x10 frame per 20ms tick. Underrun -> skip the tick.
-// Gemini delivers translated audio in bursts, often slower than real-time (esp. Arabic).
-// Draining the instant one frame arrives underruns immediately and chops the audio, so
-// hold a jitter/pre-buffer: don't START a spurt until PREBUFFER_MS is queued, giving
-// delivery a head start to stay ahead of the 20ms playback cadence.
-const PREBUFFER_MS = Number(process.env.PACER_PREBUFFER_MS || 240); // jitter buffer before playback
-const END_GAP_MS = Number(process.env.PACER_END_GAP_MS || 200);     // silence this long => spurt is over
-const PREBUFFER_BYTES = Math.round(PREBUFFER_MS / 20) * BYTES_PER_FRAME;
-const SILENCE_FRAME = Buffer.alloc(BYTES_PER_FRAME); // 20ms of 8kHz silence
+// Keep a small jitter buffer, but bound wall-clock waiting as well as audio quantity.
+// Continuous translation does not reliably emit turn-end events.
+function milliseconds(name, fallback) {
+  const value = Number(process.env[name] ?? fallback);
+  if (!Number.isFinite(value) || value < 20 || value > 2000)
+    throw new Error(`${name} must be between 20 and 2000 milliseconds`);
+  return value;
+}
+const PREBUFFER_MS = milliseconds('PACER_PREBUFFER_MS', 80);
+const MAX_WAIT_MS = milliseconds('PACER_MAX_WAIT_MS', 120);
+const END_GAP_MS = milliseconds('PACER_END_GAP_MS', 200);
+const SILENCE_FRAME = Buffer.alloc(BYTES_PER_FRAME);
 
 export class OutputPacer {
-  constructor(sock) {
+  constructor(sock, { now = () => performance.now(), prebufferMs = PREBUFFER_MS,
+    maxWaitMs = MAX_WAIT_MS, endGapMs = END_GAP_MS } = {}) {
     this.sock = sock;
-    this.queue = Buffer.alloc(0);
+    this.now = now;
+    this.prebufferBytes = Math.ceil(prebufferMs / 20) * BYTES_PER_FRAME;
+    this.maxWaitMs = maxWaitMs;
+    this.endGapMs = endGapMs;
     this.timer = null;
-    this.draining = false;
-    this.silenceRun = 0;
+    this.stats = { audioFrames: 0, silenceFrames: 0, maxQueueMs: 0, maxStartWaitMs: 0 };
+    this.flush();
   }
 
-  // No-op kept for call-site compatibility; no longer gates playback.
-  commit() {}
+  commit() { this.committed = this.queue.length > 0; }
 
   start() {
-    if (this.timer) return;
-    this.timer = setInterval(() => this._tick(), 20);
+    if (!this.timer) this.timer = setInterval(() => this._tick(), 20);
   }
 
-  // push 8kHz PCM (Buffer, 16-bit LE) to be played into the call.
   push(buf) {
+    if (!buf.length) return;
+    const now = this.now();
+    if (!this.queue.length) this.queuedAt = now;
+    this.lastPushAt = now;
     this.queue = this.queue.length ? Buffer.concat([this.queue, buf]) : buf;
-    this._rxBytes = (this._rxBytes || 0) + buf.length;
-    if (!this._rxStart) this._rxStart = Date.now();
+    this.stats.maxQueueMs = Math.max(this.stats.maxQueueMs, this.queue.length / 16);
   }
 
-  // Barge-in: drop everything still queued so stale translation audio stops immediately.
   flush() {
     this.queue = Buffer.alloc(0);
     this.draining = false;
     this.silenceRun = 0;
+    this.queuedAt = null;
+    this.lastPushAt = null;
+    this.committed = false;
   }
 
   _write(frame) {
-    if (this.sock && !this.sock.destroyed && this.sock.writable) {
+    if (this.sock && !this.sock.destroyed && this.sock.writable)
       this.sock.write(buildAudioFrame(frame));
-    }
   }
 
   _tick() {
-    // Emit one 320-byte frame per 20ms tick. Before a spurt starts, wait until PREBUFFER_BYTES
-    // is queued so bursty, sub-realtime delivery doesn't underrun mid-utterance. Once draining,
-    // on underrun emit a silence frame to hold cadence; after END_GAP_MS of silence the spurt is
-    // over and we re-prebuffer before the next one.
+    const now = this.now();
     if (!this.draining) {
-      if (this.queue.length < PREBUFFER_BYTES) return; // still filling the jitter buffer
-      this.draining = true; this.silenceRun = 0;
-      this._audioFrames = 0; this._silenceFrames = 0; this._spurtStart = Date.now();
-    }
-    if (this.queue.length >= BYTES_PER_FRAME) {
-      const frame = this.queue.subarray(0, BYTES_PER_FRAME);
-      this.queue = this.queue.subarray(BYTES_PER_FRAME);
+      if (!this.queue.length) return;
+      const waited = now - this.queuedAt;
+      if (!this.committed && this.queue.length < this.prebufferBytes && waited < this.maxWaitMs) return;
+      this.stats.maxStartWaitMs = Math.max(this.stats.maxStartWaitMs, waited);
+      this.draining = true;
       this.silenceRun = 0;
-      this._audioFrames++;
+    }
+    // A partial final frame must not wait forever, even without a model turn-end.
+    const tailReady = this.committed || now - this.lastPushAt >= this.maxWaitMs;
+    if (this.queue.length >= BYTES_PER_FRAME || (this.queue.length && tailReady)) {
+      const count = Math.min(this.queue.length, BYTES_PER_FRAME);
+      let frame = this.queue.subarray(0, count);
+      if (count < BYTES_PER_FRAME) {
+        frame = Buffer.alloc(BYTES_PER_FRAME);
+        this.queue.copy(frame);
+      }
+      this.queue = this.queue.subarray(count);
+      if (!this.queue.length) { this.queuedAt = null; this.committed = false; }
+      this.silenceRun = 0;
+      this.stats.audioFrames++;
       this._write(frame);
     } else {
-      this.silenceRun++;
-      if (this.silenceRun * 20 > END_GAP_MS) {
-        this.draining = false;
-        this._logSpurt();
-        return;
-      }
-      this._silenceFrames++;
+      this.silenceRun += 20;
+      if (this.silenceRun > this.endGapMs) { this.draining = false; return; }
+      this.stats.silenceFrames++;
       this._write(SILENCE_FRAME);
     }
-  }
-
-  _logSpurt() {
-    const a = this._audioFrames || 0, s = this._silenceFrames || 0;
-    if (a + s === 0) return;
-    // realtime ratio = how fast Gemini delivered vs playback rate. <1 => sub-realtime (gaps unavoidable).
-    const rxMs = this._rxStart ? (Date.now() - this._rxStart) : 0;
-    const audioMs = a * 20;
-    const ratio = rxMs ? (audioMs / rxMs).toFixed(2) : 'n/a';
-    console.log(`[pacer] spurt: audio=${audioMs}ms gapFills=${s * 20}ms (${a}/${a + s} frames) rxBytes=${this._rxBytes || 0} deliveryRatio=${ratio} (>=1 good, <1 sub-realtime)`);
-    this._rxBytes = 0; this._rxStart = 0;
   }
 
   stop() {
     if (this.timer) clearInterval(this.timer);
     this.timer = null;
-    this.queue = Buffer.alloc(0);
+    console.log('[pacer] playback stats', this.stats);
+    this.flush();
   }
 }

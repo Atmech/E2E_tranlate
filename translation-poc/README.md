@@ -96,3 +96,47 @@ Hang up → bridge logs `closed, duration Ns`; `curl localhost:8080/health` show
 
 Multiple simultaneous calls, WS auth, DTMF/IVR, recording, remote agent UI, Asterisk
 hardening (TLS/ACL).
+
+## Latency tuning for the Render POC
+
+The bridge still runs on the existing free Render service. No hosting migration is
+required for these changes. Open the agent page and wait for it to connect before
+placing the demo call; this keeps initial service startup separate from call timing.
+
+Optional environment variables (defaults apply without editing Render settings):
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `PACER_PREBUFFER_MS` | `80` | Amount of phone playback audio to buffer before starting |
+| `PACER_MAX_WAIT_MS` | `120` | Maximum initial queue wait, also releases partial tails after an input gap |
+| `PACER_END_GAP_MS` | `200` | Silence to bridge before returning to prebuffering |
+| `AGENT_CHUNK_MS` | `20` | Browser mic batching; accepts 20, 40, or 100 |
+| `GEMINI_CHUNK_SAMPLES` | `320` | Gemini input batch size at 16kHz (320 = 20ms) |
+
+The pacer checks every 20ms, so a timeout is serviced on the next tick; a busy event
+loop can delay it further. Short responses no longer depend on reaching a minimum
+audio quantity or receiving a model turn-end. Final partial frames are zero-padded.
+The smaller buffer favors responsiveness and may expose more gaps on slow delivery.
+For a comparison with Google's documented 100ms input chunks, set
+`AGENT_CHUNK_MS=100` and `GEMINI_CHUNK_SAMPLES=1600`. Increase the pacer buffer and
+maximum wait together if recordings show repeated playback gaps. No setting can
+make persistently slow model output both immediate and gapless.
+
+Push-to-talk release sends remaining captured samples followed by `audioStreamEnd`.
+The customer remains muted while the agent holds PTT, as in the original demo.
+Queued browser audio is cancelled when the call ends or the connection closes.
+A second concurrent phone call is rejected; sequential calls reuse the browser safely.
+
+Diagnostics (no audio content):
+- `[translator ...] setupMs`: Gemini connection setup.
+- `firstInputToOutputMs`: first accepted input to first returned audio, once per
+  session. Includes silence, source phrase duration, network and model delay; this
+  is **not** an inference measurement or an end-to-end speech latency metric.
+- `[pacer] playback stats` on hangup: maximum queued audio, maximum initial wait,
+  audio frames, and silence-fill frames. Silence fills can include ordinary pauses.
+- Browser console `[playback] maxQueuedMs` on hangup: maximum audio scheduled ahead
+  of a newly received chunk. Queues are measured, not silently truncated.
+
+Run offline regression tests with `npm test` (no Gemini calls). For the demo, test
+short replies, long sentences, PTT release mid-batch, hangup during speech, and two
+consecutive calls without refreshing. Compare the same phrases in both directions.

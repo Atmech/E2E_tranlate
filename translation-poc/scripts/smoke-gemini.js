@@ -74,7 +74,7 @@ async function main() {
       },
     });
   } catch (e) {
-    clearTimeout(timeout);
+    clearTimeout(passTimer);
     const msg = e?.message || String(e);
     if (/403|PERMISSION|NOT_FOUND|not found|allowlist/i.test(msg)) {
       done(1, `FAIL: model "${MODEL}" not accessible on this key (${msg}).\n` +

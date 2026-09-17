@@ -37,9 +37,12 @@ const tcp = net.createServer((sock) => {
   const parser = createParser(async (type, payload) => {
     switch (type) {
       case FRAME.UUID: {
+        if (bridge) { sock.end(); return; }
         callId = payload.toString('hex');
         if (activeCalls.size > 0) {
-          console.warn(`[as] second call ${callId} while ${activeCalls.size} active; POC handles one at a time`);
+          console.warn('[as] rejecting concurrent call: single-call POC');
+          sock.end();
+          return;
         }
         bridge = new CallBridge(callId, sock);
         activeCalls.set(callId, bridge);
@@ -51,7 +54,7 @@ const tcp = net.createServer((sock) => {
         } catch (e) {
           console.error(`[as] init failed for ${callId}:`, e?.message || e);
           bridge.close();
-          activeCalls.delete(callId);
+          if (activeCalls.get(callId) === bridge) activeCalls.delete(callId);
           sock.destroy();
         }
         break;
@@ -75,8 +78,8 @@ const tcp = net.createServer((sock) => {
 
   sock.on('data', (chunk) => parser(chunk));
   const teardown = () => {
-    if (callId && activeCalls.has(callId)) {
-      activeCalls.get(callId).close();
+    if (bridge && activeCalls.get(callId) === bridge) {
+      bridge.close();
       activeCalls.delete(callId);
     }
   };
@@ -113,35 +116,32 @@ const wss = new WebSocketServer({ noServer: true });
 wss.on('connection', (ws) => {
   console.log('[agent] connected');
   agents.add(ws);
-  let bound = null;
-
+  // Resolve on every message: a browser can stay connected across multiple calls.
   const bindToLiveCall = () => {
-    bound = activeCalls.values().next().value || null; // single-call POC
-    if (bound) bound.attachAgent(ws);
-    else console.warn('[agent] no active call to join yet');
+    const live = activeCalls.values().next().value;
+    if (!live?.ready || live.closed) return null;
+    live.attachAgent(ws); // idempotent; does not reset PTT for every audio packet
+    return live;
   };
-
-  // Auto-attach if a call is already live when the agent opens the page.
-  if (activeCalls.size > 0) bindToLiveCall();
+  bindToLiveCall();
 
   ws.on('message', (raw) => {
     let msg;
     try { msg = JSON.parse(raw.toString()); } catch { return; }
+    if (!msg || !['join', 'audio', 'ptt'].includes(msg.type)) return;
+    const bound = bindToLiveCall();
     if (msg.type === 'join') {
-      if (!bound) bindToLiveCall();
       ws.send(JSON.stringify({ type: 'joined', ok: !!bound }));
-    } else if (msg.type === 'audio') {
-      if (!bound) bindToLiveCall();
+    } else if (msg.type === 'audio' && typeof msg.data === 'string') {
       bound?.onAgentAudio(msg.data);
     } else if (msg.type === 'ptt') {
-      if (!bound) bindToLiveCall();
       bound?.setPtt(!!msg.active);
     }
   });
 
   ws.on('close', () => {
     agents.delete(ws);
-    bound?.detachAgent();
+    for (const call of activeCalls.values()) call.detachAgent(ws);
     console.log('[agent] disconnected');
   });
 });
@@ -177,9 +177,12 @@ asWss.on('connection', (ws) => {
   const parser = createParser(async (type, payload) => {
     switch (type) {
       case FRAME.UUID: {
+        if (bridge) { ws.close(); return; }
         callId = payload.toString('hex');
         if (activeCalls.size > 0) {
-          console.warn(`[asws] second call ${callId} while ${activeCalls.size} active`);
+          console.warn('[asws] rejecting concurrent call: single-call POC');
+          ws.close();
+          return;
         }
         bridge = new CallBridge(callId, sockShim);
         activeCalls.set(callId, bridge);
@@ -190,7 +193,7 @@ asWss.on('connection', (ws) => {
         } catch (e) {
           console.error(`[asws] init failed for ${callId}:`, e?.message || e);
           bridge.close();
-          activeCalls.delete(callId);
+          if (activeCalls.get(callId) === bridge) activeCalls.delete(callId);
           ws.close();
         }
         break;
@@ -206,8 +209,8 @@ asWss.on('connection', (ws) => {
   ws.on('message', (data) => parser(Buffer.isBuffer(data) ? data : Buffer.from(data)));
   const teardown = () => {
     sockShim.destroyed = true; sockShim.writable = false;
-    if (callId && activeCalls.has(callId)) {
-      activeCalls.get(callId).close();
+    if (bridge && activeCalls.get(callId) === bridge) {
+      bridge.close();
       activeCalls.delete(callId);
     }
   };

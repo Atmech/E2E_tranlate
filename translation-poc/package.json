@@ -5,6 +5,7 @@
   "scripts": {
     "start": "node bridge/index.js",
     "dev": "node --watch bridge/index.js",
+    "test": "node --test",
     "smoke": "node scripts/smoke-gemini.js"
   },
   "dependencies": {

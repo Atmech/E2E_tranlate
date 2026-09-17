@@ -12,6 +12,8 @@ const MODEL = process.env.GEMINI_LIVE_MODEL || 'gemini-3.5-live-translate-previe
 // dialectal/phone audio, bump GEMINI_CHUNK_SAMPLES to 640 (40ms).
 const CHUNK_SAMPLES = Number(process.env.GEMINI_CHUNK_SAMPLES || 320);
 
+if (!Number.isInteger(CHUNK_SAMPLES) || CHUNK_SAMPLES < 1 || CHUNK_SAMPLES > 16000)
+  throw new Error('GEMINI_CHUNK_SAMPLES must be an integer between 1 and 16000');
 const ai = new GoogleGenAI({ apiKey: API_KEY });
 
 // BCP-47 code -> human name, so the systemInstruction prompt is unambiguous about the
@@ -36,6 +38,8 @@ export class Translator {
     this.session = null;
     this.pending = new Int16Array(0);
     this.closed = false;
+    this.firstInputAt = null;
+    this.firstOutputLogged = false;
   }
 
   _config() {
@@ -59,7 +63,8 @@ export class Translator {
   }
 
   async start() {
-    this.session = await ai.live.connect({
+    const started = performance.now();
+    const session = await ai.live.connect({
       model: MODEL,
       config: this._config(),
       callbacks: {
@@ -69,9 +74,13 @@ export class Translator {
         onclose: (e) => console.log(`[translator ${this.targetLang}] close`, e?.reason || ''),
       },
     });
+    if (this.closed) { session.close(); return; }
+    this.session = session;
+    console.log(`[translator ${this.targetLang}] setupMs=${Math.round(performance.now() - started)}`);
   }
 
   _onMessage(m) {
+    if (this.closed) return;
     const sc = m.serverContent;
     if (!sc) return;
     if (sc.inputTranscription?.text) this.onInputText(sc.inputTranscription.text);
@@ -84,15 +93,20 @@ export class Translator {
       // fresh, 2-byte-aligned allocation), consumed synchronously by onAudio — no per-sample loop.
       const buf = Buffer.from(data, 'base64');
       const i16 = new Int16Array(buf.buffer, buf.byteOffset, buf.length >> 1);
+      if (!this.firstOutputLogged && this.firstInputAt !== null) {
+        console.log(`[translator ${this.targetLang}] firstInputToOutputMs=${Math.round(performance.now() - this.firstInputAt)} (includes input silence/network/model; not inference-only)`);
+        this.firstOutputLogged = true;
+      }
       this.onAudio(i16);
     }
     // End of a model turn: all audio for this utterance has been delivered.
     if (sc.turnComplete || sc.generationComplete) this.onTurnEnd();
   }
 
-  // feed 16kHz PCM; flush in 100ms chunks, keep remainder.
+  // Feed 16kHz PCM in configured chunks; retain the remainder until input ends.
   feed(int16_16k) {
     if (this.closed || !this.session) return;
+    if (this.firstInputAt === null) this.firstInputAt = performance.now();
     const merged = new Int16Array(this.pending.length + int16_16k.length);
     merged.set(this.pending, 0);
     merged.set(int16_16k, this.pending.length);
@@ -108,8 +122,20 @@ export class Translator {
     this.pending = merged.slice(offset);
   }
 
+  endInput() {
+    if (this.closed || !this.session) return;
+    if (this.pending.length) {
+      this.session.sendRealtimeInput({ audio: {
+        data: int16ToB64(this.pending), mimeType: 'audio/pcm;rate=16000',
+      } });
+      this.pending = new Int16Array(0);
+    }
+    this.session.sendRealtimeInput({ audioStreamEnd: true });
+  }
+
   close() {
     this.closed = true;
+    this.pending = new Int16Array(0);
     try { this.session?.close(); } catch { /* ignore */ }
     this.session = null;
   }

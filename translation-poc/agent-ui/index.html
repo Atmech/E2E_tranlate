@@ -179,6 +179,11 @@ $('url').value = `${wsProto}://${location.host}/agent`;
 let ws = null, capCtx = null, playCtx = null, workletNode = null, micStream = null;
 let playHead = 0;
 let talking = false;
+let micAcc = new Float32Array(0);
+let micChunkSamples = 320; // configurable by bridge (20/40/100ms)
+const playbackSources = new Set();
+let maxPlaybackQueueMs = 0;
+let startGeneration = 0;
 
 // ── UI state ──
 let activeCustomerBubble = null; // { el, original, translation } DOM refs
@@ -273,6 +278,7 @@ function setStatus(state) {
 }
 
 function startTimer() {
+  stopTimer();
   callStartTime = Date.now();
   $('call-timer').textContent = '0:00';
   callTimerInterval = setInterval(() => {
@@ -286,6 +292,9 @@ function stopTimer() { clearInterval(callTimerInterval); callTimerInterval = nul
 // ── PTT ──
 function setTalking(on) {
   if (on === talking) return;
+  if (!on && ws?.readyState === WebSocket.OPEN && micAcc.length)
+    ws.send(JSON.stringify({ type: 'audio', data: float32ToInt16B64(micAcc) }));
+  micAcc = new Float32Array(0);
   talking = on;
   $('ptt').classList.toggle('live', on);
   $('rec-pip').classList.toggle('on', on);
@@ -302,8 +311,18 @@ function updateMicLevel(rms) {
   });
 }
 
-// ── Gapless 24kHz playback (verbatim) ──
+function clearPlayback() {
+  for (const src of playbackSources) {
+    try { src.stop(); } catch { /* already ended */ }
+    src.disconnect();
+  }
+  playbackSources.clear();
+  playHead = 0;
+}
+
+// ── Gapless 24kHz playback ──
 function scheduleChunk(float32) {
+  if (!playCtx || playCtx.state === 'closed' || !float32.length) return;
   const buf = playCtx.createBuffer(1, float32.length, 24000);
   buf.copyToChannel(float32, 0);
   const src = playCtx.createBufferSource();
@@ -311,6 +330,9 @@ function scheduleChunk(float32) {
   src.connect(playCtx.destination);
   const now = playCtx.currentTime;
   if (playHead < now) playHead = now + 0.05; // 50ms jitter buffer
+  playbackSources.add(src);
+  src.onended = () => { playbackSources.delete(src); src.disconnect(); };
+  maxPlaybackQueueMs = Math.max(maxPlaybackQueueMs, Math.max(0, playHead - now) * 1000);
   src.start(playHead);
   playHead += buf.duration;
 }
@@ -350,33 +372,43 @@ registerProcessor('cap', CapProcessor);
 
 // ── Start / Stop ──
 async function start() {
+  const generation = ++startGeneration;
+  $('start').disabled = true;
   const url = $('url').value.trim();
-  ws = new WebSocket(url);
+  const connection = ws = new WebSocket(url);
 
   ws.onopen = () => {
+    if (ws !== connection) return;
     $('dot').classList.add('on');
     setStatus('ws-ok');
     ws.send(JSON.stringify({ type: 'join' }));
   };
   ws.onclose = () => {
-    $('dot').classList.remove('on');
-    setStatus('idle');
+    if (ws === connection) stop();
   };
   ws.onmessage = (ev) => {
+    if (ws !== connection) return;
     const msg = JSON.parse(ev.data);
     if (msg.type === 'audio') {
       scheduleChunk(int16B64ToFloat32(msg.data));
     } else if (msg.type === 'transcript') {
       handleTranscript(msg.who, msg.text);
     } else if (msg.type === 'config') {
+      if ([20, 40, 100].includes(msg.chunkMs)) micChunkSamples = msg.chunkMs * 16;
       $('badge-agent').textContent    = (msg.agentLang    || '??').toUpperCase();
       $('badge-customer').textContent = (msg.customerLang || '??').toUpperCase();
     } else if (msg.type === 'call') {
       if (msg.state === 'connected') {
+        clearPlayback();
+        setTalking(false);
+        maxPlaybackQueueMs = 0;
         setStatus('oncall');
         startTimer();
         hideHint();
       } else if (msg.state === 'ended') {
+        setTalking(false);
+        clearPlayback();
+        console.info('[playback] maxQueuedMs', Math.round(maxPlaybackQueueMs));
         setStatus('ended');
         stopTimer();
         activeCustomerBubble = null;
@@ -390,40 +422,47 @@ async function start() {
   // Playback context @24kHz
   playCtx = new AudioContext({ sampleRate: 24000 });
   await playCtx.resume();
+  if (generation !== startGeneration) return;
   playHead = 0;
 
   // Capture context @16kHz (browser resamples mic)
   capCtx = new AudioContext({ sampleRate: 16000 });
   await capCtx.resume();
-  micStream = await navigator.mediaDevices.getUserMedia({
+  if (generation !== startGeneration) return;
+  const stream = await navigator.mediaDevices.getUserMedia({
     audio: { echoCancellation: true, noiseSuppression: true },
   });
+  if (generation !== startGeneration) { stream.getTracks().forEach(t => t.stop()); return; }
+  micStream = stream;
   const srcNode = capCtx.createMediaStreamSource(micStream);
   const blobUrl = URL.createObjectURL(new Blob([WORKLET], { type: 'application/javascript' }));
-  await capCtx.audioWorklet.addModule(blobUrl);
+  try { await capCtx.audioWorklet.addModule(blobUrl); }
+  finally { URL.revokeObjectURL(blobUrl); }
+  if (generation !== startGeneration) return;
   workletNode = new AudioWorkletNode(capCtx, 'cap');
 
-  // Batch worklet frames (128 samples) into ~100ms (1600 @16kHz) chunks
-  let acc = new Float32Array(0);
-  const CHUNK = 1600;
+  // Only accumulate speech while PTT is held; release sends the partial tail.
+  micAcc = new Float32Array(0);
   workletNode.port.onmessage = (e) => {
+    if (generation !== startGeneration) return;
     const f = e.data;
     // RMS for mic meter
     let sum = 0;
     for (let i = 0; i < f.length; i++) sum += f[i] * f[i];
     updateMicLevel(Math.sqrt(sum / f.length));
 
-    const merged = new Float32Array(acc.length + f.length);
-    merged.set(acc, 0); merged.set(f, acc.length);
+    if (!talking || ws?.readyState !== WebSocket.OPEN) return;
+    const merged = new Float32Array(micAcc.length + f.length);
+    merged.set(micAcc, 0); merged.set(f, micAcc.length);
     let off = 0;
-    while (merged.length - off >= CHUNK) {
-      const chunk = merged.subarray(off, off + CHUNK);
+    while (merged.length - off >= micChunkSamples) {
+      const chunk = merged.subarray(off, off + micChunkSamples);
       // Only stream mic to the bridge while push-to-talk is held.
       if (talking && ws && ws.readyState === WebSocket.OPEN)
         ws.send(JSON.stringify({ type: 'audio', data: float32ToInt16B64(chunk) }));
-      off += CHUNK;
+      off += micChunkSamples;
     }
-    acc = merged.slice(off);
+    micAcc = merged.slice(off);
   };
   // Do NOT connect worklet to destination (avoid hearing own mic)
   srcNode.connect(workletNode);
@@ -434,12 +473,18 @@ async function start() {
 }
 
 function stop() {
+  ++startGeneration;
+  setTalking(false);
+  clearPlayback();
+  const connection = ws;
+  ws = null;
+  connection?.close();
+  $('dot').classList.remove('on');
   micStream?.getTracks().forEach((t) => t.stop());
   workletNode?.disconnect();
   capCtx?.close();
   playCtx?.close();
-  ws?.close();
-  setTalking(false);
+
   stopTimer();
   $('start').disabled = false;
   $('stop').disabled  = true;
@@ -448,13 +493,18 @@ function stop() {
   setStatus('idle');
 }
 
-$('start').onclick = () => start().catch((e) => console.error(e));
+$('start').onclick = () => {
+  const generation = startGeneration + 1;
+  start().catch((e) => { console.error(e); if (generation === startGeneration) stop(); });
+};
 $('stop').onclick  = stop;
 
 // Push-to-talk: hold button (mouse/touch) or hold Space.
 const pttBtn = $('ptt');
 pttBtn.addEventListener('mousedown', () => setTalking(true));
 pttBtn.addEventListener('touchstart', (e) => { e.preventDefault(); setTalking(true); }, { passive: false });
+window.addEventListener('blur', () => setTalking(false));
+pttBtn.addEventListener('touchcancel', () => setTalking(false));
 window.addEventListener('mouseup',  () => setTalking(false));
 pttBtn.addEventListener('touchend', () => setTalking(false));
 window.addEventListener('keydown', (e) => {
