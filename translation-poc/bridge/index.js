@@ -66,6 +66,7 @@ const tcp = net.createServer((sock) => {
         console.log(`[as] dtmf ${callId}:`, payload.toString('ascii'));
         break;
       case FRAME.HANGUP:
+        teardown();
         sock.end();
         break;
       case FRAME.ERROR:
@@ -83,6 +84,7 @@ const tcp = net.createServer((sock) => {
       activeCalls.delete(callId);
     }
   };
+  sock.on('end', teardown);
   sock.on('close', teardown);
   sock.on('error', (e) => { console.error('[as] socket error:', e?.message || e); teardown(); });
 });
@@ -131,7 +133,7 @@ wss.on('connection', (ws) => {
     if (!msg || !['join', 'audio', 'ptt'].includes(msg.type)) return;
     const bound = bindToLiveCall();
     if (msg.type === 'join') {
-      ws.send(JSON.stringify({ type: 'joined', ok: !!bound }));
+      ws.send(JSON.stringify({ type: 'joined', ok: !!bound, pending: activeCalls.size > 0 }));
     } else if (msg.type === 'audio' && typeof msg.data === 'string') {
       bound?.onAgentAudio(msg.data);
     } else if (msg.type === 'ptt') {
@@ -200,7 +202,7 @@ asWss.on('connection', (ws) => {
       }
       case FRAME.AUDIO: bridge?.onCallAudio(payload); break;
       case FRAME.DTMF: console.log(`[asws] dtmf ${callId}:`, payload.toString('ascii')); break;
-      case FRAME.HANGUP: ws.close(); break;
+      case FRAME.HANGUP: teardown(); ws.close(); break;
       case FRAME.ERROR: console.error(`[asws] error frame ${callId}:`, payload); break;
       default: break;
     }

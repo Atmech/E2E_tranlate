@@ -146,7 +146,12 @@ for (const transport of ['tcp', 'ws']) test(`${transport}: browser rebinds acros
   agent.emit('message', Buffer.from('{"type":"audio","data":"AA=="}'));
   assert.equal(bridge1.audio, 1);
   call(); assert.equal(context.calls.values().next().value, bridge1);
-  first.emit('close'); assert.equal(context.calls.size, 0);
+  // Transport close may arrive later; protocol hangup must clear the call now.
+  first.end = first.close = () => {};
+  first.emit(transport === 'tcp' ? 'data' : 'message', Buffer.from([0, 0, 0]));
+  assert.equal(context.calls.size, 0);
+  assert.equal(bridge1.closed, true);
+  first.emit('close');
   call(); await Promise.resolve();
   const bridge2 = context.calls.values().next().value;
   agent.emit('message', Buffer.from('{"type":"audio","data":"AA=="}'));
@@ -201,6 +206,7 @@ function browser() {
 
 test('browser sends 20ms chunks and flushes PTT tail before releasing', async () => {
   const b = browser(); await b.run('start()');
+  b.sockets[0].onmessage({ data: JSON.stringify({ type: 'call', state: 'connected' }) });
   b.run('setTalking(true)');
   for (let i = 0; i < 3; i++) b.worklets[0].port.onmessage({ data: new Float32Array(128).fill(0.5) });
   b.run('setTalking(false)');
@@ -253,4 +259,31 @@ test('microphone permission resolving after disconnect stops the late stream', a
   resolve({ getTracks: () => [{ stop: () => stopped++ }] });
   await starting;
   assert.equal(stopped, 1); assert.equal(b.worklets.length, 0);
+});
+
+
+test('browser separates bridge connection from mic readiness and disables PTT after hangup', async () => {
+  const b = browser();
+  let resolveMic, requested;
+  const pending = new Promise(r => { requested = r; });
+  b.context.navigator.mediaDevices.getUserMedia = () => new Promise(r => { resolveMic = r; requested(); });
+  const starting = b.run('start()');
+  await pending;
+  b.sockets[0].onopen();
+  b.sockets[0].onmessage({ data: JSON.stringify({ type: 'call', state: 'connected' }) });
+  assert.equal(b.run("$('bridge-status').textContent"), 'Bridge connected');
+  assert.equal(b.run("$('ptt').disabled"), true);
+  b.run('setTalking(true)');
+  assert.equal(b.run('talking'), false);
+  resolveMic({ getTracks: () => [] });
+  await starting;
+  assert.equal(b.run("$('ptt').disabled"), false);
+  b.run('setTalking(true)');
+  b.sockets[0].onmessage({ data: JSON.stringify({ type: 'call', state: 'ended' }) });
+  assert.equal(b.run("$('status-pill').textContent"), 'Call Ended');
+  assert.equal(b.run("$('ptt').disabled"), true);
+  assert.equal(b.run('talking'), false);
+  assert.equal(b.run('callTimerInterval'), null);
+  b.run('setTalking(true)');
+  assert.equal(b.run('talking'), false);
 });

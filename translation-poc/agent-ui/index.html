@@ -137,7 +137,9 @@ footer {
 
 <header>
   <span class="conn-dot" id="dot"></span>
-  <span class="status-pill" id="status-pill">Idle</span>
+  <span class="status-pill" id="status-pill">Call status unknown</span>
+  <span class="status-pill" id="bridge-status">Bridge offline</span>
+  <span class="status-pill" id="mic-status">Mic off</span>
   <span class="call-timer" id="call-timer"></span>
   <div class="lang-badges">
     <span class="lang-badge agent"    id="badge-agent">??</span>
@@ -149,7 +151,7 @@ footer {
 
 <main id="conv">
   <div class="empty-hint" id="hint">
-    Dial <strong>5000</strong> to start a call
+    Start your mic, then dial <strong>5000</strong>.<br>Hold to Talk is available during a call.
   </div>
 </main>
 
@@ -157,7 +159,7 @@ footer {
   <div class="footer-top">
     <input id="url" />
     <button class="btn-start" id="start">Start mic</button>
-    <button class="btn-stop"  id="stop" disabled>Stop</button>
+    <button class="btn-stop"  id="stop" disabled>Stop mic & disconnect</button>
     <div class="mic-wrap"><div class="mic-fill" id="mic-meter"></div></div>
   </div>
   <div class="ptt-row">
@@ -184,6 +186,7 @@ let micChunkSamples = 320; // configurable by bridge (20/40/100ms)
 const playbackSources = new Set();
 let maxPlaybackQueueMs = 0;
 let startGeneration = 0;
+let callActive = false, micReady = false;
 
 // ── UI state ──
 let activeCustomerBubble = null; // { el, original, translation } DOM refs
@@ -268,11 +271,12 @@ function setStatus(state) {
   const pill = $('status-pill');
   pill.className = 'status-pill';
   const map = {
-    'ws-ok':  ['ws-ok',  'Connected'],
+    'ws-ok':  ['ws-ok',  'No active call'],
     'oncall': ['oncall', 'On Call'],
+    'starting': ['oncall', 'Translation starting'],
     'ended':  ['ended',  'Call Ended'],
   };
-  const [cls, label] = map[state] || [null, 'Idle'];
+  const [cls, label] = map[state] || [null, 'Call status unknown'];
   if (cls) pill.classList.add(cls);
   pill.textContent = label;
 }
@@ -290,7 +294,12 @@ function startTimer() {
 function stopTimer() { clearInterval(callTimerInterval); callTimerInterval = null; }
 
 // ── PTT ──
+function updateControls() {
+  $('ptt').disabled = !(callActive && micReady && ws?.readyState === WebSocket.OPEN);
+}
+
 function setTalking(on) {
+  if (on && (!callActive || !micReady || ws?.readyState !== WebSocket.OPEN)) return;
   if (on === talking) return;
   if (!on && ws?.readyState === WebSocket.OPEN && micAcc.length)
     ws.send(JSON.stringify({ type: 'audio', data: float32ToInt16B64(micAcc) }));
@@ -374,13 +383,17 @@ registerProcessor('cap', CapProcessor);
 async function start() {
   const generation = ++startGeneration;
   $('start').disabled = true;
+  $('stop').disabled = false;
+  $('bridge-status').textContent = 'Bridge connecting';
+  $('mic-status').textContent = 'Mic permission / starting';
   const url = $('url').value.trim();
   const connection = ws = new WebSocket(url);
 
   ws.onopen = () => {
     if (ws !== connection) return;
     $('dot').classList.add('on');
-    setStatus('ws-ok');
+    $('bridge-status').textContent = 'Bridge connected';
+    updateControls();
     ws.send(JSON.stringify({ type: 'join' }));
   };
   ws.onclose = () => {
@@ -389,7 +402,11 @@ async function start() {
   ws.onmessage = (ev) => {
     if (ws !== connection) return;
     const msg = JSON.parse(ev.data);
-    if (msg.type === 'audio') {
+    if (msg.type === 'joined' && !msg.ok) {
+      callActive = false;
+      setStatus(msg.pending ? 'starting' : 'ws-ok');
+      updateControls();
+    } else if (msg.type === 'audio' && callActive) {
       scheduleChunk(int16B64ToFloat32(msg.data));
     } else if (msg.type === 'transcript') {
       handleTranscript(msg.who, msg.text);
@@ -399,6 +416,8 @@ async function start() {
       $('badge-customer').textContent = (msg.customerLang || '??').toUpperCase();
     } else if (msg.type === 'call') {
       if (msg.state === 'connected') {
+        callActive = true;
+        updateControls();
         clearPlayback();
         setTalking(false);
         maxPlaybackQueueMs = 0;
@@ -406,7 +425,10 @@ async function start() {
         startTimer();
         hideHint();
       } else if (msg.state === 'ended') {
+        callActive = false;
+        micAcc = new Float32Array(0);
         setTalking(false);
+        updateControls();
         clearPlayback();
         console.info('[playback] maxQueuedMs', Math.round(maxPlaybackQueueMs));
         setStatus('ended');
@@ -469,11 +491,16 @@ async function start() {
 
   $('start').disabled = true;
   $('stop').disabled  = false;
-  $('ptt').disabled   = false;
+  micReady = true;
+  $('mic-status').textContent = 'Mic ready — hold to talk';
+  updateControls();
 }
 
 function stop() {
   ++startGeneration;
+  callActive = false;
+  micReady = false;
+  micAcc = new Float32Array(0);
   setTalking(false);
   clearPlayback();
   const connection = ws;
@@ -491,11 +518,13 @@ function stop() {
   $('ptt').disabled   = true;
   $('mic-meter').style.width = '0';
   setStatus('idle');
+  $('bridge-status').textContent = 'Bridge offline';
+  $('mic-status').textContent = 'Mic off';
 }
 
 $('start').onclick = () => {
   const generation = startGeneration + 1;
-  start().catch((e) => { console.error(e); if (generation === startGeneration) stop(); });
+  start().catch((e) => { console.error(e); if (generation === startGeneration) { stop(); $('mic-status').textContent = `Could not start: ${e.message}`; } });
 };
 $('stop').onclick  = stop;
 
