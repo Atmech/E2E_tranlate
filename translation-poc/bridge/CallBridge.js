@@ -79,7 +79,8 @@ export class CallBridge {
   setPtt(active) {
     if (this.closed || active === this.agentTalking) return;
     this.agentTalking = active;
-    if (!active) this.toCustomer.endInput();
+    if (active) this.toCustomer.beginInput();
+    else this.toCustomer.endInput();
   }
 
   // 0x10 payload from Asterisk (PCM 16-bit LE 8kHz) -> Gemini customer->agent.

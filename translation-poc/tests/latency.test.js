@@ -76,17 +76,82 @@ function loadModule(file, bindings, exports) {
   return context.result;
 }
 
-function translator(connect) {
+function translator(connect, bindings = {}) {
   const { Translator } = loadModule('../bridge/Translator.js', {
     GoogleGenAI: class { live = { connect }; }, Modality: { AUDIO: 'AUDIO' },
-    int16ToB64: audio.int16ToB64,
+    int16ToB64: audio.int16ToB64, ...bindings,
   }, 'Translator');
   return new Translator('ar');
 }
 
-test('PTT release sends pending input before stream-end and can resume', async () => {
+function inputTailClock() {
+  const timers = new Map(); let id = 0;
+  return {
+    timers,
+    setInterval(fn, ms) { assert.equal(ms, 100); timers.set(++id, fn); return id; },
+    clearInterval(id) { timers.delete(id); },
+    tick() { for (const fn of [...timers.values()]) fn(); },
+  };
+}
+
+test('translation PTT release flushes real samples then bounded silence then stream-end', async () => {
+  const sent = [], clock = inputTailClock();
+  const t = translator(async () => ({ sendRealtimeInput: m => sent.push(m) }), clock);
+  await t.start(); t.feed(new Int16Array(128).fill(123)); t.endInput();
+  assert.equal(Buffer.from(sent[0].audio.data, 'base64').length, 256);
+  assert.equal(sent.length, 1);
+  t.endInput(); // repeated releases must not create duplicate tail timers
+  assert.equal(clock.timers.size, 1);
+  for (let i = 0; i < 20; i++) clock.tick();
+  assert.equal(sent.length, 22);
+  for (const frame of sent.slice(1, 21)) {
+    assert.deepEqual(Buffer.from(frame.audio.data, 'base64'), Buffer.alloc(3200));
+  }
+  assert.equal(sent[21].audioStreamEnd, true);
+  assert.equal(clock.timers.size, 0);
+  clock.tick(); assert.equal(sent.length, 22);
+  t.feed(new Int16Array(320)); assert.equal(sent.length, 23);
+});
+
+test('new press or audio cancels old silence tail without ending the new input', async () => {
+  for (const resume of [t => t.beginInput(), t => t.feed(new Int16Array(320))]) {
+    const sent = [], clock = inputTailClock();
+    const t = translator(async () => ({ sendRealtimeInput: m => sent.push(m) }), clock);
+    await t.start(); t.feed(new Int16Array(320)); t.endInput(); clock.tick();
+    resume(t);
+    assert.equal(clock.timers.size, 0);
+    const count = sent.length;
+    for (let i = 0; i < 25; i++) clock.tick();
+    assert.equal(sent.length, count);
+    assert.equal(sent.some(m => m.audioStreamEnd), false);
+    t.close();
+  }
+});
+
+test('hangup cancels pending release silence; empty PTT emits no audio', async () => {
+  const sent = [], clock = inputTailClock();
+  const t = translator(async () => ({ sendRealtimeInput: m => sent.push(m) }), clock);
+  await t.start(); t.beginInput(); t.endInput();
+  assert.equal(clock.timers.size, 0); assert.equal(sent.length, 0);
+  t.feed(new Int16Array(320)); t.endInput(); t.close();
+  clock.tick(); assert.equal(sent.length, 1); assert.equal(clock.timers.size, 0);
+});
+
+test('quick empty re-press still finishes the previous utterance on release', async () => {
+  const sent = [], clock = inputTailClock();
+  const t = translator(async () => ({ sendRealtimeInput: m => sent.push(m) }), clock);
+  await t.start(); t.feed(new Int16Array(320)); t.endInput(); clock.tick();
+  t.beginInput(); t.endInput();
+  for (let i = 0; i < 20; i++) clock.tick();
+  assert.equal(sent.filter(m => m.audioStreamEnd).length, 1);
+  assert.equal(clock.timers.size, 0);
+});
+
+test('general model still sends pending input directly followed by stream-end', async () => {
   const sent = [];
-  const t = translator(async () => ({ sendRealtimeInput: m => sent.push(m) }));
+  const t = translator(async () => ({ sendRealtimeInput: m => sent.push(m) }), {
+    process: { env: { GEMINI_LIVE_MODEL: 'gemini-general-test' } },
+  });
   await t.start(); t.feed(new Int16Array(128)); t.endInput();
   assert.equal(Buffer.from(sent[0].audio.data, 'base64').length, 256);
   assert.equal(sent[1].audioStreamEnd, true);
@@ -231,7 +296,7 @@ test('hangup and disconnect cancel queued browser playback; mic can restart', as
 });
 
 test('reattaching same browser preserves PTT; closing another browser cannot detach it', async () => {
-  class Translator { async start() {} endInput() { this.ended = true; } close() {} }
+  class Translator { async start() {} beginInput() {} endInput() { this.ended = true; } close() {} }
   const { CallBridge } = loadModule('../bridge/CallBridge.js', {
     Translator, OutputPacer: class { start() {} stop() {} },
     WebSocket: { OPEN: 1 }, ...audio,

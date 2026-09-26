@@ -5,6 +5,11 @@ import { int16ToB64 } from './audio.js';
 
 const API_KEY = process.env.GEMINI_API_KEY;
 const MODEL = process.env.GEMINI_LIVE_MODEL || 'gemini-3.5-live-translate-preview';
+// Live Translate can leave final words pending despite audioStreamEnd. Advance its
+// continuous input with 2s of synthetic silence, in real time, before ending input.
+const INPUT_TAIL_CHUNKS = 20;
+const INPUT_TAIL_MS = 100;
+const INPUT_SILENCE = new Int16Array(1600); // 100ms at 16kHz; never microphone audio
 
 // Chunk sent to Gemini. 1600 = 100ms (old default) added up to 100ms of buffering before
 // audio even reached the model. The Live API accepts smaller chunks; 320 = 20ms (1:1 with
@@ -40,6 +45,8 @@ export class Translator {
     this.closed = false;
     this.firstInputAt = null;
     this.firstOutputLogged = false;
+    this.inputTailTimer = null;
+    this.inputOpen = false;
   }
 
   _config() {
@@ -71,7 +78,11 @@ export class Translator {
         onopen: () => console.log(`[translator ${this.targetLang}] open`),
         onmessage: (m) => this._onMessage(m),
         onerror: (e) => console.error(`[translator ${this.targetLang}] error:`, e?.message || e),
-        onclose: (e) => console.log(`[translator ${this.targetLang}] close`, e?.reason || ''),
+        onclose: (e) => {
+          this._cancelInputTail();
+          this.session = null;
+          console.log(`[translator ${this.targetLang}] close`, e?.reason || '');
+        },
       },
     });
     if (this.closed) { session.close(); return; }
@@ -105,7 +116,9 @@ export class Translator {
 
   // Feed 16kHz PCM in configured chunks; retain the remainder until input ends.
   feed(int16_16k) {
-    if (this.closed || !this.session) return;
+    if (this.closed || !this.session || !int16_16k.length) return;
+    this.beginInput();
+    this.inputOpen = true;
     if (this.firstInputAt === null) this.firstInputAt = performance.now();
     const merged = new Int16Array(this.pending.length + int16_16k.length);
     merged.set(this.pending, 0);
@@ -122,18 +135,51 @@ export class Translator {
     this.pending = merged.slice(offset);
   }
 
+  // Cancel a previous release tail before a new PTT press or new real input.
+  beginInput() {
+    // If a quick press has no audio, its release must still finish the old tail.
+    if (this.inputTailTimer !== null) this.inputOpen = true;
+    this._cancelInputTail();
+  }
+
+  _cancelInputTail() {
+    if (this.inputTailTimer !== null) clearInterval(this.inputTailTimer);
+    this.inputTailTimer = null;
+  }
+
   endInput() {
-    if (this.closed || !this.session) return;
+    if (this.closed || !this.session || !this.inputOpen) return;
+    this.inputOpen = false;
     if (this.pending.length) {
       this.session.sendRealtimeInput({ audio: {
         data: int16ToB64(this.pending), mimeType: 'audio/pcm;rate=16000',
       } });
       this.pending = new Int16Array(0);
     }
-    this.session.sendRealtimeInput({ audioStreamEnd: true });
+    if (!MODEL.includes('translate')) {
+      this.session.sendRealtimeInput({ audioStreamEnd: true });
+      return;
+    }
+    let remaining = INPUT_TAIL_CHUNKS;
+    this.inputTailTimer = setInterval(() => {
+      if (this.closed || !this.session) { this._cancelInputTail(); return; }
+      try {
+        this.session.sendRealtimeInput({ audio: {
+          data: int16ToB64(INPUT_SILENCE), mimeType: 'audio/pcm;rate=16000',
+        } });
+        if (--remaining === 0) {
+          this._cancelInputTail();
+          this.session.sendRealtimeInput({ audioStreamEnd: true });
+        }
+      } catch (e) {
+        this._cancelInputTail();
+        console.error(`[translator ${this.targetLang}] input tail failed:`, e?.message || e);
+      }
+    }, INPUT_TAIL_MS);
   }
 
   close() {
+    this._cancelInputTail();
     this.closed = true;
     this.pending = new Int16Array(0);
     try { this.session?.close(); } catch { /* ignore */ }

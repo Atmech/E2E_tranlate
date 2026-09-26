@@ -122,7 +122,12 @@ For a comparison with Google's documented 100ms input chunks, set
 maximum wait together if recordings show repeated playback gaps. No setting can
 make persistently slow model output both immediate and gapless.
 
-Push-to-talk release sends remaining captured samples followed by `audioStreamEnd`.
+Push-to-talk release sends remaining captured samples. With Live Translate, the bridge
+then sends two seconds of synthetic silence in 100ms chunks before `audioStreamEnd`.
+This addresses final words staying pending until the next input, reproduced with a
+synthetic speech test against the preview model. Microphone audio stops on release;
+only generated silence continues. A new press cancels the tail; hangup cancels it too.
+General Live models send `audioStreamEnd` immediately after the captured samples.
 The customer remains muted while the agent holds PTT, as in the original demo.
 Queued browser audio is cancelled when the call ends or the connection closes.
 A second concurrent phone call is rejected; sequential calls reuse the browser safely.
