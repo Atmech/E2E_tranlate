@@ -18,9 +18,17 @@ function pacer() {
 test('short response plays by maximum wait without turn-end', () => {
   const { output, frames, tick } = pacer();
   output.push(Buffer.alloc(320, 1));
-  tick(100); assert.equal(frames.length, 0);
-  tick(120); assert.equal(frames.length, 1);
+  tick(100); assert.deepEqual(frames[0], Buffer.alloc(320));
+  tick(120); assert.deepEqual(frames[1], Buffer.alloc(320, 1));
   assert.equal(output.queue.length, 0);
+});
+
+test('idle call sends silence continuously through the AudioSocket timeout window', () => {
+  const { output, frames, tick } = pacer();
+  for (let ms = 20; ms <= 3000; ms += 20) tick(ms);
+  assert.equal(frames.length, 150);
+  assert.ok(frames.every(frame => frame.equals(Buffer.alloc(320))));
+  assert.equal(output.stats.silenceFrames, 150);
 });
 
 test('buffer threshold starts promptly and emits only one frame per tick', () => {
@@ -52,10 +60,10 @@ test('partial response drains on timeout without commit', () => {
 test('flush discards queued audio and next response gets its own wait', () => {
   const { output, frames, tick } = pacer();
   output.push(Buffer.alloc(30)); output.commit(); output.flush(); tick(200);
-  assert.equal(frames.length, 0);
+  assert.deepEqual(frames[0], Buffer.alloc(320));
   output.push(Buffer.alloc(320)); tick(300);
-  assert.equal(frames.length, 0);
-  tick(320); assert.equal(frames.length, 1);
+  assert.deepEqual(frames[1], Buffer.alloc(320));
+  tick(320); assert.equal(frames.length, 3);
 });
 
 test('split and coalesced AudioSocket frames remain intact', () => {

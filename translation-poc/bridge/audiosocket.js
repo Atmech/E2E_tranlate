@@ -96,12 +96,22 @@ export class OutputPacer {
       this.sock.write(buildAudioFrame(frame));
   }
 
+  _writeSilence() {
+    this.stats.silenceFrames++;
+    this._write(SILENCE_FRAME);
+  }
+
   _tick() {
     const now = this.now();
     if (!this.draining) {
-      if (!this.queue.length) return;
+      // Asterisk closes an AudioSocket call after two seconds without incoming
+      // frames. Keep the socket active while translation is starting or idle.
+      if (!this.queue.length) { this._writeSilence(); return; }
       const waited = now - this.queuedAt;
-      if (!this.committed && this.queue.length < this.prebufferBytes && waited < this.maxWaitMs) return;
+      if (!this.committed && this.queue.length < this.prebufferBytes && waited < this.maxWaitMs) {
+        this._writeSilence();
+        return;
+      }
       this.stats.maxStartWaitMs = Math.max(this.stats.maxStartWaitMs, waited);
       this.draining = true;
       this.silenceRun = 0;
@@ -122,9 +132,8 @@ export class OutputPacer {
       this._write(frame);
     } else {
       this.silenceRun += 20;
-      if (this.silenceRun > this.endGapMs) { this.draining = false; return; }
-      this.stats.silenceFrames++;
-      this._write(SILENCE_FRAME);
+      if (this.silenceRun > this.endGapMs) this.draining = false;
+      this._writeSilence();
     }
   }
 
