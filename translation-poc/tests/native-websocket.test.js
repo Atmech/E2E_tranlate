@@ -6,7 +6,7 @@ import { handleNativeConnection } from '../bridge/native-websocket.js';
 const start = { event: 'MEDIA_START', connection_id: 'test-call', format: 'slin', optimal_frame_size: 320, ptime: 20 };
 const settle = () => new Promise(resolve => setImmediate(resolve));
 
-function connect(t, { activeCalls = new Map(), agents = new Set(), init } = {}) {
+function connect(t, { activeCalls = new Map(), agents = new Set(), init, loopback = false } = {}) {
   const ws = new EventEmitter();
   ws.readyState = 1; ws.bufferedAmount = 0; ws.sent = [];
   ws.send = (data, options) => ws.sent.push({ data, options });
@@ -14,7 +14,7 @@ function connect(t, { activeCalls = new Map(), agents = new Set(), init } = {}) 
     ws.closeCode = code; ws.closeReason = reason; ws.readyState = 3; ws.emit('close');
   };
   let call;
-  handleNativeConnection(ws, { activeCalls, agents, createBridge: (id, sock, { pacer }) => {
+  handleNativeConnection(ws, { activeCalls, agents, loopback, createBridge: (id, sock, { pacer }) => {
     call = {
       id, sock, pacer, audio: [], attached: [], closed: false,
       init: init || (async () => {}),
@@ -101,5 +101,37 @@ test('disconnect during initialization cannot reattach a browser; setup failure 
 test('slow network closes call instead of accumulating an unbounded WebSocket send buffer', t => {
   const c = connect(t); c.control(start); c.ws.bufferedAmount = 80001;
   c.call.pacer.push(Buffer.alloc(320)); c.call.pacer.commit(); c.call.pacer._tick();
+  assert.equal(c.ws.closeCode, 1008); assert.equal(c.activeCalls.size, 0);
+});
+
+for (const format of ['text', 'json']) test(`${format}: loopback echoes exact binary audio without creating translators`, async t => {
+  const c = connect(t, { loopback: true, agents: new Set([{}]) });
+  c.control(format === 'json' ? start : 'MEDIA_START connection_id:test-call format:slin optimal_frame_size:320 ptime:20');
+  await settle();
+  assert.equal(c.call, undefined, 'translation bridge factory must not run');
+  assert.equal(c.activeCalls.size, 1);
+  assert.equal(c.activeCalls.get('test-call').ready, false, 'browser must not bind to echo test');
+  assert.equal(c.ws.sent.length, 0, 'control events must not be echoed as audio');
+  const pcm = Buffer.alloc(320);
+  for (let i = 0; i < 160; i++) pcm.writeInt16LE(i * 100 - 8000, i * 2);
+  c.audio(pcm);
+  assert.deepEqual(c.ws.sent, [{ data: pcm, options: { binary: true } }]);
+  c.control('MEDIA_XOFF'); c.audio(pcm);
+  assert.equal(c.ws.sent.length, 1, 'respect Asterisk flow control');
+  c.control('MEDIA_XON'); c.audio(pcm);
+  assert.equal(c.ws.sent.length, 2);
+  c.ws.close(1000); c.audio(pcm);
+  assert.equal(c.activeCalls.size, 0); assert.equal(c.ws.sent.length, 2);
+});
+
+test('loopback preserves setup validation, single-call exclusion, and slow-network protection', t => {
+  const early = connect(t, { loopback: true }); early.audio(Buffer.alloc(320));
+  assert.equal(early.ws.closeCode, 1008);
+  const wrong = connect(t, { loopback: true }); wrong.control({ ...start, format: 'ulaw' });
+  assert.equal(wrong.ws.closeCode, 1008);
+  const c = connect(t, { loopback: true }); c.control(start);
+  const concurrent = connect(t, { loopback: true, activeCalls: c.activeCalls }); concurrent.control(start);
+  assert.equal(concurrent.ws.closeCode, 1008); assert.equal(c.activeCalls.size, 1);
+  c.ws.bufferedAmount = 80001; c.audio(Buffer.alloc(320));
   assert.equal(c.ws.closeCode, 1008); assert.equal(c.activeCalls.size, 0);
 });

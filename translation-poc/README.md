@@ -90,6 +90,27 @@ Dial **5001** only if you want to compare the legacy AudioSocket connection.
 Hang up → bridge logs `closed, duration Ns`; `curl localhost:8080/health` shows
 `activeCalls: 0`.
 
+## Temporary phone loopback test
+
+Set the bridge's runtime environment variable `MEDIA_LOOPBACK=true` and restart or
+redeploy it. The `/media` handler then echoes each received binary PCM message back
+to the same Asterisk connection, without creating Gemini translation sessions.
+Rajiv bhai should hear the original voice back on the phone with network delay.
+The browser agent is not needed. Existing startup requirements, including the
+configured API key, remain in place.
+
+Use the same `/media` URL, `media` subprotocol, and `slin` codec. A valid `MEDIA_START`
+is still required. Runtime Logs show `mode=loopback`, followed by received/sent byte
+counts on the first audio packet and every 100 packets (about two seconds at 20ms).
+Text control messages are never echoed. During Asterisk's `MEDIA_XOFF`, live echo
+audio is discarded and counted as `droppedBytes`; sending resumes on `MEDIA_XON`.
+
+For DigitalOcean, add the variable to the translation component's runtime environment
+in Settings and let it redeploy after this code has been deployed. Set it to `false`
+or remove it and redeploy to restore translation. Loopback is off by default.
+Do not connect Asterisk's `Echo` application to this mode: use a normal phone call,
+otherwise both sides can repeatedly echo the same audio.
+
 ## Gotchas
 
 - **Docker RTP/NAT (Mac):** Docker Desktop has no host networking. If SIP registers but
