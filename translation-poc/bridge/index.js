@@ -2,6 +2,7 @@
 //   - TCP server (AudioSocket) for Asterisk        :AUDIOSOCKET_PORT
 //   - HTTP server: GET /health + static agent-ui/   :BRIDGE_HTTP_PORT
 //   - WS /agent on the HTTP server for the browser agent
+//   - WS /media for native Asterisk media; /audiosocket for the legacy relay
 import 'dotenv/config';
 import net from 'node:net';
 import http from 'node:http';
@@ -11,6 +12,7 @@ import { fileURLToPath } from 'node:url';
 import { WebSocketServer } from 'ws';
 import { createParser, FRAME } from './audiosocket.js';
 import { CallBridge } from './CallBridge.js';
+import { handleNativeConnection } from './native-websocket.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const UI_DIR = path.join(__dirname, '..', 'agent-ui');
@@ -151,6 +153,11 @@ wss.on('connection', (ws) => {
 // ---- WS /audiosocket (relay.js connects here instead of raw TCP) ----
 // Wraps each WS connection in a socket-like shim so CallBridge sees the same interface.
 const asWss = new WebSocketServer({ noServer: true });
+// Native chan_websocket uses raw PCM and text control events, not AudioSocket frames.
+const mediaWss = new WebSocketServer({ noServer: true, maxPayload: 65500 });
+mediaWss.on('connection', ws => handleNativeConnection(ws, {
+  activeCalls, agents, createBridge: (...args) => new CallBridge(...args),
+}));
 
 // Single upgrade handler routes by pathname to the right WS server.
 httpServer.on('upgrade', (req, socket, head) => {
@@ -159,6 +166,8 @@ httpServer.on('upgrade', (req, socket, head) => {
     wss.handleUpgrade(req, socket, head, (ws) => wss.emit('connection', ws, req));
   } else if (pathname === AS_WS_PATH) {
     asWss.handleUpgrade(req, socket, head, (ws) => asWss.emit('connection', ws, req));
+  } else if (pathname === '/media') {
+    mediaWss.handleUpgrade(req, socket, head, (ws) => mediaWss.emit('connection', ws, req));
   } else {
     socket.destroy();
   }
@@ -221,4 +230,4 @@ asWss.on('connection', (ws) => {
   console.log('[asws] relay connected');
 });
 
-httpServer.listen(HTTP_PORT, () => console.log(`http on :${HTTP_PORT} (agent ui + ws ${AGENT_WS_PATH} + audiosocket ws ${AS_WS_PATH})`));
+httpServer.listen(HTTP_PORT, () => console.log(`http on :${HTTP_PORT} (agent ui + ws ${AGENT_WS_PATH} + audiosocket ws ${AS_WS_PATH} + native ws /media)`));

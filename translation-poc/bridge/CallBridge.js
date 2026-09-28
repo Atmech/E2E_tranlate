@@ -1,4 +1,4 @@
-// Orchestrates one active call. Holds the AudioSocket TCP socket, the agent browser WS,
+// Orchestrates one active call. Holds the customer media transport, the agent browser WS,
 // and the two per-direction Gemini Translator sessions. Routes audio between them.
 //
 // Use case: agent speaks AGENT_LANG; customer hears it in CUSTOMER_LANG. Customer speaks
@@ -14,11 +14,11 @@ const AGENT_CHUNK_MS = Number(process.env.AGENT_CHUNK_MS || 20);
 if (![20, 40, 100].includes(AGENT_CHUNK_MS)) throw new Error('AGENT_CHUNK_MS must be 20, 40, or 100');
 
 export class CallBridge {
-  constructor(callId, sock) {
+  constructor(callId, sock, { pacer = new OutputPacer(sock) } = {}) {
     this.callId = callId;
-    this.sock = sock;             // AudioSocket TCP connection (customer leg)
+    this.sock = sock;             // customer TCP socket or WebSocket adapter
     this.agentWs = null;          // agent browser WS
-    this.pacer = new OutputPacer(sock);
+    this.pacer = pacer;
     this.startedAt = Date.now();
     this.agentTalking = false;    // PTT state
     this.closed = false;
@@ -83,7 +83,7 @@ export class CallBridge {
     else this.toCustomer.endInput();
   }
 
-  // 0x10 payload from Asterisk (PCM 16-bit LE 8kHz) -> Gemini customer->agent.
+  // Raw PCM 16-bit LE 8kHz from either Asterisk transport -> Gemini customer->agent.
   onCallAudio(payload) {
     if (this.closed || this.agentTalking) return;
     const i8 = bufToInt16(payload);
