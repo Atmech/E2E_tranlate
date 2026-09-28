@@ -2,7 +2,8 @@
 // No AudioSocket framing, relay process, or additional network hop.
 import { OutputPacer } from './audiosocket.js';
 
-export function handleNativeConnection(ws, { activeCalls, agents, createBridge }) {
+export function handleNativeConnection(ws, { activeCalls, agents, createBridge,
+  loopback = process.env.MEDIA_LOOPBACK === 'true' }) {
   let bridge, callId, paused = false, ended = false;
   const stats = { receivedBytes: 0, sentBytes: 0 };
   const sock = {
@@ -29,7 +30,8 @@ export function handleNativeConnection(ws, { activeCalls, agents, createBridge }
     cleanup();
     ws.close(1008, reason);
   };
-  const startTimer = setTimeout(() => fail('MEDIA_START timeout'), 5000);
+  // Temporary debugging window for Rajiv bhai's Asterisk connection (normally 5000ms).
+  const startTimer = setTimeout(() => fail('MEDIA_START timeout'), 30000);
   startTimer.unref?.();
 
   ws.on('message', async (data, isBinary) => {
@@ -63,10 +65,30 @@ export function handleNativeConnection(ws, { activeCalls, agents, createBridge }
         if (activeCalls.size) return fail('Single-call POC is busy');
         clearTimeout(startTimer);
         callId = event.connection_id;
-        const pacer = new OutputPacer(sock, { encodeFrame: pcm => pcm, sendSilence: false });
-        bridge = createBridge(callId, sock, { pacer });
+        if (loopback) {
+          // Temporary phone echo test: no Gemini sessions and no browser agent audio.
+          let packets = 0;
+          stats.droppedBytes = 0;
+          bridge = {
+            ready: false,
+            async init() {},
+            attachAgent() {},
+            detachAgent() {},
+            close() {},
+            onCallAudio(pcm) {
+              // During XOFF discard live echo input rather than accumulating delay.
+              if (sock.writable) sock.write(pcm);
+              else stats.droppedBytes += pcm.length;
+              if (++packets === 1 || packets % 100 === 0)
+                console.log(`[media] loopback ${callId} packets=${packets}`, stats);
+            },
+          };
+        } else {
+          const pacer = new OutputPacer(sock, { encodeFrame: pcm => pcm, sendSilence: false });
+          bridge = createBridge(callId, sock, { pacer });
+        }
         activeCalls.set(callId, bridge);
-        console.log(`[media] call up: ${callId} (slin 8000Hz, native WebSocket)`);
+        console.log(`[media] call up: ${callId} (slin 8000Hz, native WebSocket, mode=${loopback ? 'loopback' : 'translation'})`);
         await bridge.init();
         if (ended) return;
         for (const agent of agents) bridge.attachAgent(agent);
