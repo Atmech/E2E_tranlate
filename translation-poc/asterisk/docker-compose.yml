@@ -1,10 +1,6 @@
-# Asterisk (with AudioSocket) for the translation POC.
-# AudioSocket needs Asterisk 18+. The container reaches the Node bridge on the Mac host
-# via host.docker.internal:9092 (see extensions.conf).
-#
-# NOTE: config mount paths vary by image. mlan/docker-asterisk reads /etc/asterisk.
-# Verify res_audiosocket + app_audiosocket are present after boot:
-#   docker compose exec asterisk asterisk -x "module show like audiosocket"
+# Native media WebSocket requires Asterisk 20.16+/21.11+/22.6+/23+.
+# Asterisk connects directly to the host bridge at ws://host.docker.internal:8080/media.
+# Verify: docker compose exec asterisk asterisk -rx "module show like websocket"
 services:
   asterisk:
     image: andrius/asterisk:latest
@@ -19,3 +15,4 @@ services:
     volumes:
       - ./pjsip.conf:/etc/asterisk/pjsip.conf:ro
       - ./extensions.conf:/etc/asterisk/extensions.conf:ro
+      - ./websocket_client.conf:/etc/asterisk/websocket_client.conf:ro

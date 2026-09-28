@@ -56,8 +56,11 @@ const SILENCE_FRAME = Buffer.alloc(BYTES_PER_FRAME);
 
 export class OutputPacer {
   constructor(sock, { now = () => performance.now(), prebufferMs = PREBUFFER_MS,
-    maxWaitMs = MAX_WAIT_MS, endGapMs = END_GAP_MS } = {}) {
+    maxWaitMs = MAX_WAIT_MS, endGapMs = END_GAP_MS,
+    encodeFrame = buildAudioFrame, sendSilence = true } = {}) {
     this.sock = sock;
+    this.encodeFrame = encodeFrame;
+    this.sendSilence = sendSilence;
     this.now = now;
     this.prebufferBytes = Math.ceil(prebufferMs / 20) * BYTES_PER_FRAME;
     this.maxWaitMs = maxWaitMs;
@@ -93,15 +96,18 @@ export class OutputPacer {
 
   _write(frame) {
     if (this.sock && !this.sock.destroyed && this.sock.writable)
-      this.sock.write(buildAudioFrame(frame));
+      this.sock.write(this.encodeFrame(frame));
   }
 
   _writeSilence() {
+    if (!this.sendSilence) return;
     this.stats.silenceFrames++;
     this._write(SILENCE_FRAME);
   }
 
   _tick() {
+    // Native WebSocket MEDIA_XOFF pauses consumption as well as writes.
+    if (this.sock?.writable === false || this.sock?.destroyed) return;
     const now = this.now();
     if (!this.draining) {
       // Asterisk closes an AudioSocket call after two seconds without incoming

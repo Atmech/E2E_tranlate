@@ -1,14 +1,15 @@
-# Live Call Translation POC (Asterisk AudioSocket + Zoiper + Gemini)
+# Live Call Translation POC (Asterisk WebSocket + Zoiper + Gemini)
 
 Customer speaks **Hindi** into a softphone → a human **agent in the browser** hears live
 **English**. Agent replies in English → customer hears live **Hindi**. Translation by
 Gemini Live (`gemini-3.5-live-translate-preview`).
 
-Media transport is **Asterisk AudioSocket** (free, natively full-duplex, raw PCM over TCP)
-— not FreeSWITCH mod_audio_stream (whose two-way playback is commercial-only).
+Media transport is **Asterisk native media WebSocket** (`chan_websocket`). Asterisk
+connects directly to the bridge's `/media` endpoint; `relay.js` is not used.
+Both sides exchange raw signed 16-bit little-endian mono PCM at 8kHz (`slin`).
 
 ```
-Customer (Zoiper 1000) --SIP/RTP--> Asterisk --AudioSocket(TCP 9092)--> Node bridge
+Customer (Zoiper 1000) --SIP/RTP--> Asterisk --WebSocket /media--> Node bridge
                                                                           |   ^
                                                        hi->en translator  |   | en->hi translator
                                                                           v   |
@@ -19,9 +20,10 @@ The **agent is the browser UI**, not a second phone. Only one softphone is neede
 
 ## Layout
 
-- `bridge/` — Node bridge: AudioSocket TCP server + agent WebSocket + HTTP/UI host
+- `bridge/` — Node bridge: native media WebSocket + agent WebSocket + HTTP/UI host;
+  legacy AudioSocket TCP and relay WebSocket endpoints remain for comparison
 - `agent-ui/index.html` — browser agent (mic capture + gapless playback + transcripts)
-- `asterisk/` — `pjsip.conf`, `extensions.conf`, `docker-compose.yml`
+- `asterisk/` — SIP, dialplan, WebSocket client, and Docker Compose configuration
 - `scripts/smoke-gemini.js` — verify Gemini model access **before** anything else
 
 ## Step 0 — Gemini smoke test (do this FIRST)
@@ -44,17 +46,20 @@ npm run smoke
 ```bash
 npm start
 # audiosocket on :9092
-# http on :8080 (agent ui + ws /agent)
+# http on :8080 (agent ui + ws /agent + audiosocket ws /audiosocket + native ws /media)
 ```
 
 ## Step 2 — Start Asterisk
 
-Edit `asterisk/pjsip.conf`: replace `<MAC_LAN_IP>` with your Mac's LAN IP (`ipconfig getifaddr en0`).
+Edit `asterisk/pjsip.conf`: set `external_media_address` and
+`external_signaling_address` to your Mac's LAN IP (`ipconfig getifaddr en0`).
+Native media WebSocket requires Asterisk 20.16+, 21.11+, 22.6+, or 23+.
+The local setup was verified with Asterisk 22.9.0.
 
 ```bash
 cd asterisk
 docker compose up -d
-docker compose exec asterisk asterisk -x "module show like audiosocket"   # expect res_/app_audiosocket
+docker compose exec asterisk asterisk -x "module show like websocket"    # expect chan_websocket + res_websocket_client
 docker compose exec asterisk asterisk -x "pjsip show endpoints"           # expect 1000
 ```
 
@@ -75,7 +80,9 @@ Domain:   <MAC_LAN_IP>:5060
 
 ## Step 5 — Call
 
-From Zoiper, dial **5000**. Bridge logs `call up: <uuid>`.
+From Zoiper, dial **5000**. Bridge logs `[media] Asterisk WebSocket connected`, then
+`[media] call up: <connection-id>` and the translators becoming ready.
+Dial **5001** only if you want to compare the legacy AudioSocket connection.
 
 - Speak Hindi into Zoiper → agent browser hears English + sees transcripts.
 - Speak English into the browser mic → Zoiper hears Hindi.
@@ -88,9 +95,49 @@ Hang up → bridge logs `closed, duration Ns`; `curl localhost:8080/health` show
 - **Docker RTP/NAT (Mac):** Docker Desktop has no host networking. If SIP registers but
   there's no audio, the `external_media_address` in `pjsip.conf` is wrong/missing. If it
   still won't flow, run Asterisk in a Linux VM (multipass/UTM, bridged networking) instead.
-  AudioSocket (TCP 9092 to the host) is unaffected.
+  The native media WebSocket connection to the host does not depend on SIP/RTP NAT.
 - **One call at a time** — POC scope; a second concurrent call logs a warning.
-- **Languages** configurable via `SRC_LANG`/`DST_LANG` in `.env` (BCP-47).
+- **Languages** configurable via `CUSTOMER_LANG`/`AGENT_LANG` in `.env` (BCP-47).
+
+## Test the direct connection without a phone or Gemini
+
+Start Asterisk using the Compose configuration above, and stop `npm start` if it is
+running: the smoke test temporarily listens on the same port 8080.
+From `translation-poc/`, run:
+
+```bash
+npm test
+npm run smoke:asterisk-ws
+```
+
+The smoke test places two sequential real Asterisk calls through `5000@demo`, with
+Asterisk's `Echo` application on the other leg. It sends known PCM from the bridge,
+checks that Asterisk returns the exact samples over WebSocket, and checks cleanup
+on both sides. It uses the production native media handler with a test audio source
+in place of Gemini. This proves transport and call lifecycle, not translation quality.
+After it exits, run `npm start` for the normal browser/Zoiper translation demo.
+
+Connection sequence:
+
+1. Dial 5000: Asterisk connects to `ws://host.docker.internal:8080/media` using the
+   `translation` client in `asterisk/websocket_client.conf`.
+2. Asterisk sends `MEDIA_START`; the bridge validates `slin`, 320-byte frames, and
+   20ms packetization, reserves the single call, and starts the two translators.
+3. Binary WebSocket messages carry raw PCM in both directions. Text events carry
+   call metadata, DTMF, and playback flow control. Both plain-text and JSON control
+   events are accepted. AudioSocket headers are never sent on this endpoint.
+4. Translated audio uses the existing 20ms pacer with raw PCM output. Asterisk
+   generates idle silence; `MEDIA_XOFF` pauses queue consumption until `MEDIA_XON`.
+5. Hangup closes the socket, stops playback/translators, frees the call, and lets
+   the same browser join the next call.
+
+For a later hosted test, change the client's URI to `wss://<app-domain>/media` and
+set `tls_enabled = yes`, keeping certificate and hostname verification enabled.
+The app's HTTP ingress must route WebSocket upgrades to the bridge's HTTP port.
+This is a local POC: the media endpoint is currently unauthenticated; access control
+must be added before exposing it for unrestricted remote use.
+
+Protocol/config reference: [Asterisk native media WebSocket](https://docs.asterisk.org/Configuration/Channel-Drivers/WebSocket/).
 
 ## Out of scope
 
