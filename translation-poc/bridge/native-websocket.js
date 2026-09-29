@@ -1,9 +1,15 @@
 // Asterisk chan_websocket: text control events + raw binary slin (8kHz PCM).
 // No AudioSocket framing, relay process, or additional network hop.
 import { OutputPacer } from './audiosocket.js';
+import { MediaTranslation } from './MediaTranslation.js';
+
+const MODE = process.env.MEDIA_MODE || (process.env.MEDIA_LOOPBACK === 'true' ? 'loopback' : 'translation');
+if (!['translation', 'loopback'].includes(MODE)) throw new Error('MEDIA_MODE must be translation or loopback');
+const SOURCE_LANG = process.env.MEDIA_SOURCE_LANG || 'hi';
+const TARGET_LANG = process.env.MEDIA_TARGET_LANG || 'en';
 
 export function handleNativeConnection(ws, { activeCalls, agents, createBridge,
-  loopback = process.env.MEDIA_LOOPBACK === 'true' }) {
+  mode = MODE }) {
   let bridge, callId, paused = false, ended = false;
   const stats = { receivedBytes: 0, sentBytes: 0 };
   const sock = {
@@ -65,7 +71,7 @@ export function handleNativeConnection(ws, { activeCalls, agents, createBridge,
         if (activeCalls.size) return fail('Single-call POC is busy');
         clearTimeout(startTimer);
         callId = event.connection_id;
-        if (loopback) {
+        if (mode === 'loopback') {
           // Temporary phone echo test: no Gemini sessions and no browser agent audio.
           let packets = 0;
           stats.droppedBytes = 0;
@@ -85,10 +91,12 @@ export function handleNativeConnection(ws, { activeCalls, agents, createBridge,
           };
         } else {
           const pacer = new OutputPacer(sock, { encodeFrame: pcm => pcm, sendSilence: false });
-          bridge = createBridge(callId, sock, { pacer });
+          bridge = mode === 'translation'
+            ? new MediaTranslation(callId, sock, pacer, { sourceLang: SOURCE_LANG, targetLang: TARGET_LANG })
+            : createBridge(callId, sock, { pacer });
         }
         activeCalls.set(callId, bridge);
-        console.log(`[media] call up: ${callId} (slin 8000Hz, native WebSocket, mode=${loopback ? 'loopback' : 'translation'})`);
+        console.log(`[media] call up: ${callId} (slin 8000Hz, native WebSocket, mode=${mode})`);
         await bridge.init();
         if (ended) return;
         for (const agent of agents) bridge.attachAgent(agent);

@@ -6,7 +6,7 @@ import { handleNativeConnection } from '../bridge/native-websocket.js';
 const start = { event: 'MEDIA_START', connection_id: 'test-call', format: 'slin', optimal_frame_size: 320, ptime: 20 };
 const settle = () => new Promise(resolve => setImmediate(resolve));
 
-function connect(t, { activeCalls = new Map(), agents = new Set(), init, loopback = false } = {}) {
+function connect(t, { activeCalls = new Map(), agents = new Set(), init, mode = 'mock' } = {}) {
   const ws = new EventEmitter();
   ws.readyState = 1; ws.bufferedAmount = 0; ws.sent = [];
   ws.send = (data, options) => ws.sent.push({ data, options });
@@ -14,7 +14,7 @@ function connect(t, { activeCalls = new Map(), agents = new Set(), init, loopbac
     ws.closeCode = code; ws.closeReason = reason; ws.readyState = 3; ws.emit('close');
   };
   let call;
-  handleNativeConnection(ws, { activeCalls, agents, loopback, createBridge: (id, sock, { pacer }) => {
+  handleNativeConnection(ws, { activeCalls, agents, mode, createBridge: (id, sock, { pacer }) => {
     call = {
       id, sock, pacer, audio: [], attached: [], closed: false,
       init: init || (async () => {}),
@@ -105,7 +105,7 @@ test('slow network closes call instead of accumulating an unbounded WebSocket se
 });
 
 for (const format of ['text', 'json']) test(`${format}: loopback echoes exact binary audio without creating translators`, async t => {
-  const c = connect(t, { loopback: true, agents: new Set([{}]) });
+  const c = connect(t, { mode: 'loopback', agents: new Set([{}]) });
   c.control(format === 'json' ? start : 'MEDIA_START connection_id:test-call format:slin optimal_frame_size:320 ptime:20');
   await settle();
   assert.equal(c.call, undefined, 'translation bridge factory must not run');
@@ -125,12 +125,12 @@ for (const format of ['text', 'json']) test(`${format}: loopback echoes exact bi
 });
 
 test('loopback preserves setup validation, single-call exclusion, and slow-network protection', t => {
-  const early = connect(t, { loopback: true }); early.audio(Buffer.alloc(320));
+  const early = connect(t, { mode: 'loopback' }); early.audio(Buffer.alloc(320));
   assert.equal(early.ws.closeCode, 1008);
-  const wrong = connect(t, { loopback: true }); wrong.control({ ...start, format: 'ulaw' });
+  const wrong = connect(t, { mode: 'loopback' }); wrong.control({ ...start, format: 'ulaw' });
   assert.equal(wrong.ws.closeCode, 1008);
-  const c = connect(t, { loopback: true }); c.control(start);
-  const concurrent = connect(t, { loopback: true, activeCalls: c.activeCalls }); concurrent.control(start);
+  const c = connect(t, { mode: 'loopback' }); c.control(start);
+  const concurrent = connect(t, { mode: 'loopback', activeCalls: c.activeCalls }); concurrent.control(start);
   assert.equal(concurrent.ws.closeCode, 1008); assert.equal(c.activeCalls.size, 1);
   c.ws.bufferedAmount = 80001; c.audio(Buffer.alloc(320));
   assert.equal(c.ws.closeCode, 1008); assert.equal(c.activeCalls.size, 0);
