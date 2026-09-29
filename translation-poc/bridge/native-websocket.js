@@ -1,15 +1,13 @@
 // Asterisk chan_websocket: text control events + raw binary slin (8kHz PCM).
 // No AudioSocket framing, relay process, or additional network hop.
 import { OutputPacer } from './audiosocket.js';
-import { MediaTranslation } from './MediaTranslation.js';
+import { CallTranslationSession, readMediaMetadata } from './MediaTranslation.js';
 
 const MODE = process.env.MEDIA_MODE || (process.env.MEDIA_LOOPBACK === 'true' ? 'loopback' : 'translation');
 if (!['translation', 'loopback'].includes(MODE)) throw new Error('MEDIA_MODE must be translation or loopback');
-const SOURCE_LANG = process.env.MEDIA_SOURCE_LANG || 'hi';
-const TARGET_LANG = process.env.MEDIA_TARGET_LANG || 'en';
 
-export function handleNativeConnection(ws, { activeCalls, agents, createBridge,
-  mode = MODE }) {
+export function handleNativeConnection(ws, { activeCalls, agents = new Set(), createBridge,
+  mode = MODE, createTranslator, setupTimeoutMs }) {
   let bridge, callId, paused = false, ended = false;
   const stats = { receivedBytes: 0, sentBytes: 0 };
   const sock = {
@@ -21,7 +19,7 @@ export function handleNativeConnection(ws, { activeCalls, agents, createBridge,
       stats.sentBytes += pcm.length;
       ws.send(pcm, { binary: true });
     },
-    end() { cleanup(); ws.close(1000); },
+    end(code = 1000, reason) { if (ended) return; cleanup(); ws.close(code, reason); },
   };
   const cleanup = () => {
     if (ended) return;
@@ -68,6 +66,27 @@ export function handleNativeConnection(ws, { activeCalls, agents, createBridge,
           return fail('Expected slin 8kHz mono with 320-byte 20ms frames');
         }
         if (!event.connection_id) return fail('Missing connection_id');
+        if (mode === 'translation') {
+          const metadata = readMediaMetadata(event.channel_variables);
+          let session = activeCalls.get(metadata.callId);
+          if (session && !(session instanceof CallTranslationSession)) return fail('Single-call POC is busy');
+          if (!session) {
+            if (activeCalls.size) return fail('Single-call POC is busy');
+            session = new CallTranslationSession(metadata.callId, {
+              createTranslator, setupTimeoutMs,
+              onClose: () => {
+                if (activeCalls.get(metadata.callId) === session) activeCalls.delete(metadata.callId);
+              },
+            });
+            activeCalls.set(metadata.callId, session);
+          }
+          const pacer = new OutputPacer(sock, { encodeFrame: pcm => pcm, sendSilence: false });
+          bridge = session.addLeg(metadata, sock, pacer);
+          callId = metadata.callId;
+          clearTimeout(startTimer);
+          console.log(`[media] call up: ${callId} role=${metadata.role} (slin 8000Hz, mode=translation)`);
+          return;
+        }
         if (activeCalls.size) return fail('Single-call POC is busy');
         clearTimeout(startTimer);
         callId = event.connection_id;
@@ -91,9 +110,8 @@ export function handleNativeConnection(ws, { activeCalls, agents, createBridge,
           };
         } else {
           const pacer = new OutputPacer(sock, { encodeFrame: pcm => pcm, sendSilence: false });
-          bridge = mode === 'translation'
-            ? new MediaTranslation(callId, sock, pacer, { sourceLang: SOURCE_LANG, targetLang: TARGET_LANG })
-            : createBridge(callId, sock, { pacer });
+          // Injected audio source used by the transport-only smoke test.
+          bridge = createBridge(callId, sock, { pacer });
         }
         activeCalls.set(callId, bridge);
         console.log(`[media] call up: ${callId} (slin 8000Hz, native WebSocket, mode=${mode})`);

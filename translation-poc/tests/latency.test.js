@@ -230,6 +230,15 @@ for (const transport of ['tcp', 'ws']) test(`${transport}: browser rebinds acros
   agent.emit('message', Buffer.from('{"type":"audio","data":"AA=="}'));
   assert.equal(bridge1.audio, 1); assert.equal(bridge2.audio, 1);
   agent.emit('close'); assert.equal(bridge2.agentWs, null);
+  context.calls.clear();
+  context.calls.set('native-pair', { ready: true, closed: false, acceptsBrowserAudio: false });
+  const unrelatedBrowser = new EventEmitter(), replies = [];
+  unrelatedBrowser.send = message => replies.push(JSON.parse(message));
+  wsServers[0].emit('connection', unrelatedBrowser);
+  unrelatedBrowser.emit('message', Buffer.from('{"type":"join"}'));
+  unrelatedBrowser.emit('message', Buffer.from('{"type":"audio","data":"AA=="}'));
+  assert.equal(replies[0].ok, false, 'browser cannot join a paired native call');
+  unrelatedBrowser.emit('close'); // Native sessions have no detachAgent method.
 });
 
 function browser() {
@@ -359,4 +368,33 @@ test('browser separates bridge connection from mic readiness and disables PTT af
   assert.equal(b.run('callTimerInterval'), null);
   b.run('setTalking(true)');
   assert.equal(b.run('talking'), false);
+});
+
+test('translator reports unexpected closure and errors, but not intentional shutdown', async () => {
+  let callbacks;
+  const t = translator(async options => {
+    callbacks = options.callbacks;
+    return { close() { callbacks.onclose({ reason: 'client shutdown' }); } };
+  });
+  const failures = [];
+  t.onFailure = error => failures.push(error);
+  await t.start();
+  callbacks.onerror(new Error('transport failed'));
+  callbacks.onclose({ reason: 'upstream closed' });
+  assert.equal(failures.length, 2);
+  t.close();
+  callbacks.onclose({ reason: 'late close' });
+  callbacks.onerror(new Error('late error'));
+  assert.equal(failures.length, 2);
+});
+
+test('translator closed while connecting disposes late session', async () => {
+  let resolve, closed = 0;
+  const t = translator(() => new Promise(r => { resolve = r; }));
+  const starting = t.start();
+  t.close();
+  resolve({ close() { closed++; } });
+  await starting;
+  assert.equal(closed, 1);
+  assert.equal(t.session, null);
 });

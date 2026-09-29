@@ -27,7 +27,7 @@ if (!process.env.GEMINI_API_KEY) {
   process.exit(1);
 }
 
-const activeCalls = new Map(); // callId -> CallBridge
+const activeCalls = new Map(); // callId -> legacy CallBridge or paired CallTranslationSession
 const agents = new Set();      // currently connected agent WS sockets
 
 // ---- AudioSocket TCP server (Asterisk connects here) ----
@@ -123,7 +123,7 @@ wss.on('connection', (ws) => {
   // Resolve on every message: a browser can stay connected across multiple calls.
   const bindToLiveCall = () => {
     const live = activeCalls.values().next().value;
-    if (!live?.ready || live.closed) return null;
+    if (!live?.ready || live.closed || live.acceptsBrowserAudio === false) return null;
     live.attachAgent(ws); // idempotent; does not reset PTT for every audio packet
     return live;
   };
@@ -145,7 +145,7 @@ wss.on('connection', (ws) => {
 
   ws.on('close', () => {
     agents.delete(ws);
-    for (const call of activeCalls.values()) call.detachAgent(ws);
+    for (const call of activeCalls.values()) call.detachAgent?.(ws);
     console.log('[agent] disconnected');
   });
 });

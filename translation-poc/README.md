@@ -1,194 +1,164 @@
-# Live Call Translation POC (Asterisk WebSocket + Zoiper + Gemini)
+# Asterisk call translation POC
 
-Customer speaks **Hindi** into a softphone → a human **agent in the browser** hears live
-**English**. Agent replies in English → customer hears live **Hindi**. Translation by
-Gemini Live (`gemini-3.5-live-translate-preview`).
+Both the caller and the human agent are connected to Asterisk. Asterisk opens two
+WebSockets to the Node backend's `/media` endpoint, one per participant. Node pairs
+them by `CALL_ID` and uses a separate Gemini Live translator for each direction:
 
-Media transport is **Asterisk native media WebSocket** (`chan_websocket`). Asterisk
-connects directly to the bridge's `/media` endpoint; `relay.js` is not used.
-Both sides exchange raw signed 16-bit little-endian mono PCM at 8kHz (`slin`).
-
-```
-Customer (Zoiper 1000) --SIP/RTP--> Asterisk --WebSocket /media--> Node bridge
-                                                                          |   ^
-                                                       hi->en translator  |   | en->hi translator
-                                                                          v   |
-                                                              Agent browser UI (mic + speakers)
+```text
+Caller microphone -> caller WebSocket -> Hindi to English -> agent WebSocket -> agent hears English
+Agent microphone  -> agent WebSocket  -> English to Hindi -> caller WebSocket -> caller hears Hindi
 ```
 
-The **agent is the browser UI**, not a second phone. Only one softphone is needed.
+Each socket is bidirectional. Input is that participant's microphone; output is
+translated speech from the other participant. The native path uses no browser
+agent and no `relay.js`. Audio is raw signed 16-bit little-endian mono PCM at 8kHz
+(`slin`), with 320 bytes per 20ms frame.
 
-## Layout
-
-- `bridge/` — Node bridge: native media WebSocket + agent WebSocket + HTTP/UI host;
-  legacy AudioSocket TCP and relay WebSocket endpoints remain for comparison
-- `agent-ui/index.html` — browser agent (mic capture + gapless playback + transcripts)
-- `asterisk/` — SIP, dialplan, WebSocket client, and Docker Compose configuration
-- `scripts/smoke-gemini.js` — verify Gemini model access **before** anything else
-
-## Step 0 — Gemini smoke test (do this FIRST)
-
-`gemini-3.5-live-translate-preview` is an **allowlist preview** — not enabled on every key.
+## Start the backend
 
 ```bash
-cp .env.example .env          # add GEMINI_API_KEY
+cp .env.example .env       # fill in GEMINI_API_KEY; do not overwrite an existing .env
 npm install
-npm run smoke
-```
-
-- `OK` → model works, proceed.
-- `FAIL ... 403 / NOT_FOUND` → preview not on your key. Set
-  `GEMINI_LIVE_MODEL=gemini-2.0-flash-live-001` in `.env` and re-run. That model is
-  generally accessible; the bridge auto-switches to prompt-driven translation for it.
-
-## Step 1 — Start the bridge
-
-```bash
 npm start
-# audiosocket on :9092
-# http on :8080 (agent ui + ws /agent + audiosocket ws /audiosocket + native ws /media)
 ```
 
-## Step 2 — Start Asterisk
+Set `MEDIA_MODE=translation` (default). `MEDIA_SOURCE_LANG` and `MEDIA_TARGET_LANG`
+are no longer used: each connection must provide its languages. The existing Gemini
+Live model performs transcription and translated speech generation; this is not a
+separate Google Cloud Streaming STT service. `npm run smoke` checks model access.
 
-Edit `asterisk/pjsip.conf`: set `external_media_address` and
-`external_signaling_address` to your Mac's LAN IP (`ipconfig getifaddr en0`).
-Native media WebSocket requires Asterisk 20.16+, 21.11+, 22.6+, or 23+.
-The local setup was verified with Asterisk 22.9.0.
+## Connection contract for Rajiv bhai
+
+Connect both participants to `wss://<app-domain>/media` using the WebSocket
+subprotocol `media`. Use JSON control messages (`f(json)` on Asterisk). Set the four
+variables on the corresponding WebSocket channel before Asterisk emits its
+`MEDIA_START`, so they appear in `channel_variables`.
+
+Caller example (other standard Asterisk event fields may also be present):
+
+```json
+{
+  "event": "MEDIA_START",
+  "connection_id": "translation_media",
+  "format": "slin",
+  "optimal_frame_size": 320,
+  "ptime": 20,
+  "channel_variables": {
+    "CALL_ID": "abc123",
+    "ROLE": "caller",
+    "SOURCE_LANG": "hi",
+    "TARGET_LANG": "en"
+  }
+}
+```
+
+Agent uses the same event format, with:
+
+```json
+"channel_variables": {
+  "CALL_ID": "abc123",
+  "ROLE": "agent",
+  "SOURCE_LANG": "en",
+  "TARGET_LANG": "hi"
+}
+```
+
+- Use a unique `CALL_ID` for each phone conversation, identical on its two sockets.
+  Allowed characters: letters, digits, underscore, dot, colon and hyphen; 1–128 characters.
+  `connection_id` is transport metadata, not the pairing key.
+- Roles must be exactly `caller` and `agent`. Languages must be reciprocal, as above.
+  Language codes must be supported by the configured model.
+- Either participant can connect first. The backend waits up to 30 seconds for the
+  other, then up to 30 seconds for both translators to start.
+- Audio arriving before `translation ready` is dropped and counted at hangup.
+  Start speaking after readiness during testing. There is no custom readiness
+  control message sent to Asterisk.
+- A missing/invalid field or duplicate role rejects that new connection. An unrelated
+  concurrent call is rejected; this remains a one-call POC (two sockets per call).
+- If either participant disconnects, startup times out, or a translator fails,
+  both sockets and translators close. Reconnecting requires a fresh pair.
+- `MEDIA_XOFF` pauses output only to that participant; `MEDIA_XON` resumes it.
+  Queued output is bounded to 30 seconds and a slow WebSocket send buffer to five
+  seconds; exceeding either ends the call rather than accumulating audio indefinitely.
+
+Rajiv bhai's Asterisk routing must send each participant's microphone separately,
+play returned audio only to that participant, and exclude translated playback from
+microphone input. Pairing in Node does not configure Asterisk bridges or isolate
+mixed audio automatically.
+
+## DigitalOcean deployment and call test
+
+Deploy this code with `MEDIA_MODE=translation` and the existing Gemini API key/model.
+Use **one running app instance**: pairing is stored in process memory. Multiple
+instances or a rolling deployment can split the two sockets; wait until deployment
+is complete before testing. Restarting the process ends active calls.
+
+1. Rajiv bhai connects both participant channels with the metadata above.
+2. Runtime Logs should show `joined role=caller`, `joined role=agent`, then
+   `translation ready: caller->agent and agent->caller` for the same call ID.
+3. Caller speaks Hindi: logs show `[stt <id> caller]` and
+   `[translation <id> caller->agent]`; only the agent should hear English.
+4. Agent speaks English: the caller should hear Hindi. Check that neither party
+   hears their own translated voice and translated playback does not start another
+   translation cycle.
+5. Hang up either side: both sockets close; `/health` returns `activeCalls: 0`.
+   Repeat with another call to check cleanup.
+
+The `/media` endpoint remains unauthenticated in this POC. Call IDs identify sessions;
+they are not credentials. Production authentication and multi-instance routing are
+outside this change.
+
+## Automated checks
 
 ```bash
-cd asterisk
-docker compose up -d
-docker compose exec asterisk asterisk -x "module show like websocket"    # expect chan_websocket + res_websocket_client
-docker compose exec asterisk asterisk -x "pjsip show endpoints"           # expect 1000
+npm test                    # offline regressions; fake translators, no network/API key
+npm run test:media-ws        # real localhost WebSockets, fake translator; no Asterisk/Gemini
+npm run smoke:asterisk-ws    # existing real Asterisk single-connection transport smoke
 ```
 
-If your image stores configs elsewhere than `/etc/asterisk`, adjust the volume mounts.
+The offline tests cover opposite-side audio routing, either connection order,
+metadata rejection, startup/hangup races, model failures, flow control and cleanup.
+The localhost test negotiates `media` and exchanges real WebSocket frames through
+the native handler. Its deterministic fake model verifies routing, not language quality.
 
-## Step 3 — Open the agent UI
+For `smoke:asterisk-ws`, start the Docker setup in `asterisk/` and stop `npm start`
+first: the script owns port 8080. It makes two sequential calls through `5000@demo`,
+using Asterisk Echo and an injected audio source. This is a single-connection
+transport check, not a paired call or live translation check.
 
-Browser → `http://localhost:8080/` → **Start mic** (allow mic permission). Dot turns green.
-
-## Step 4 — Register Zoiper as the customer
-
-```
-Account type: SIP
-Username: 1000
-Password: 1234
-Domain:   <MAC_LAN_IP>:5060
-```
-
-## Step 5 — Call
-
-From Zoiper, dial **5000**. Bridge logs `[media] Asterisk WebSocket connected`, then
-`[media] call up: <connection-id>` and the translators becoming ready.
-Dial **5001** only if you want to compare the legacy AudioSocket connection.
-
-- Speak Hindi into Zoiper → agent browser hears English + sees transcripts.
-- Speak English into the browser mic → Zoiper hears Hindi.
-
-Hang up → bridge logs `closed, duration Ns`; `curl localhost:8080/health` shows
-`activeCalls: 0`.
-
-## Asterisk media translation test
-
-Native Asterisk `/media` defaults to `MEDIA_MODE=translation`. It streams 8kHz call
-audio into the existing Gemini Live translator, logs source transcription and
-translated text, synthesizes translated speech, and sends the 8kHz audio back through
-the same Asterisk media connection. Set `MEDIA_SOURCE_LANG=hi` and
-`MEDIA_TARGET_LANG=en` for Hindi-to-English, or reverse these for English-to-Hindi.
-This tests one source-to-target direction on an Asterisk call; it does not pair
-customer and agent legs or return opposite translations to each participant.
-For this test, set `MEDIA_MODE=translation`, `MEDIA_SOURCE_LANG=hi`, and
-`MEDIA_TARGET_LANG=en` in the DigitalOcean component's runtime environment, then
-redeploy. Call through the Asterisk ARI flow. Runtime Logs should show
-`mode=translation`, `translation ready`, `[stt ...]` source text,
-`[translation ...]` translated text, and non-zero `sentBytes` at hangup.
-
-This uses the repo's existing Gemini Live API key. It is not a separate Google Cloud
-Streaming STT integration. The Live model provides transcription and translated audio
-in the same streaming session.
+The bundled `5000` dialplan does not set the four pairing fields. Use it for the
+transport smoke or loopback test; a paired phone test requires Rajiv bhai's two-leg
+Asterisk routing and metadata. Local Asterisk was previously verified at 22.9.0.
 
 ## Temporary phone loopback test
 
-Set the bridge's runtime environment variable `MEDIA_MODE=loopback` and restart or
-redeploy it. The `/media` handler then echoes each received binary PCM message back
-to the same Asterisk connection, without creating Gemini translation sessions.
-Rajiv bhai should hear the original voice back on the phone with network delay.
-The browser agent is not needed. Existing startup requirements, including the
-configured API key, remain in place.
+Set `MEDIA_MODE=loopback` and restart. This echoes binary PCM to the same socket
+without Gemini. It needs a valid `MEDIA_START` but not the four pairing fields;
+plain-text and JSON control events work for loopback. Only one connection is allowed.
+During `MEDIA_XOFF`, input is discarded rather than queued.
 
-Use the same `/media` URL, `media` subprotocol, and `slin` codec. A valid `MEDIA_START`
-is still required. Runtime Logs show `mode=loopback`, followed by received/sent byte
-counts on the first audio packet and every 100 packets (about two seconds at 20ms).
-Text control messages are never echoed. During Asterisk's `MEDIA_XOFF`, live echo
-audio is discarded and counted as `droppedBytes`; sending resumes on `MEDIA_XON`.
+Use a normal phone call, not Asterisk Echo, to avoid repeated echoes. Restore
+`MEDIA_MODE=translation` and restart for paired translation. `MEDIA_LOOPBACK=true`
+is supported only when `MEDIA_MODE` is unset; explicit `MEDIA_MODE` takes precedence.
 
-For DigitalOcean, add the variable to the translation component's runtime environment
-in Settings and let it redeploy after this code has been deployed. Set `MEDIA_MODE=translation`
-to restore translation. Loopback is off by default.
-Do not connect Asterisk's `Echo` application to this mode: use a normal phone call,
-otherwise both sides can repeatedly echo the same audio.
+## Legacy browser demo
 
-## Gotchas
+The older caller-phone to browser-agent flow remains on AudioSocket TCP port 9092
+or `/audiosocket` via `relay.js`. Register Zoiper as extension 1000, open
+`http://localhost:8080/` for the browser agent, and dial **5001**. Set
+`CUSTOMER_LANG` and `AGENT_LANG` for this legacy flow. Browser audio cannot attach
+to a native paired call.
 
-- **Docker RTP/NAT (Mac):** Docker Desktop has no host networking. If SIP registers but
-  there's no audio, the `external_media_address` in `pjsip.conf` is wrong/missing. If it
-  still won't flow, run Asterisk in a Linux VM (multipass/UTM, bridged networking) instead.
-  The native media WebSocket connection to the host does not depend on SIP/RTP NAT.
-- **One call at a time** — POC scope; a second concurrent call logs a warning.
-- **Languages** configurable via `CUSTOMER_LANG`/`AGENT_LANG` in `.env` (BCP-47).
+For Docker SIP/RTP on Mac, set `external_media_address` and
+`external_signaling_address` in `asterisk/pjsip.conf` to the Mac's LAN IP before
+starting `docker compose up -d` in `asterisk/`.
 
-## Test the direct connection without a phone or Gemini
+Protocol reference: [Asterisk native media WebSocket](https://docs.asterisk.org/Configuration/Channel-Drivers/WebSocket/).
 
-Start Asterisk using the Compose configuration above, and stop `npm start` if it is
-running: the smoke test temporarily listens on the same port 8080.
-From `translation-poc/`, run:
+## Legacy browser demo latency tuning
 
-```bash
-npm test
-npm run smoke:asterisk-ws
-```
-
-The smoke test places two sequential real Asterisk calls through `5000@demo`, with
-Asterisk's `Echo` application on the other leg. It sends known PCM from the bridge,
-checks that Asterisk returns the exact samples over WebSocket, and checks cleanup
-on both sides. It uses the production native media handler with a test audio source
-in place of Gemini. This proves transport and call lifecycle, not translation quality.
-After it exits, run `npm start` for the normal browser/Zoiper translation demo.
-
-Connection sequence:
-
-1. Dial 5000: Asterisk connects to `ws://host.docker.internal:8080/media` using the
-   `translation` client in `asterisk/websocket_client.conf`.
-2. Asterisk sends `MEDIA_START`; the bridge validates `slin`, 320-byte frames, and
-   20ms packetization, reserves the single call, and starts the two translators.
-3. Binary WebSocket messages carry raw PCM in both directions. Text events carry
-   call metadata, DTMF, and playback flow control. Both plain-text and JSON control
-   events are accepted. AudioSocket headers are never sent on this endpoint.
-4. Translated audio uses the existing 20ms pacer with raw PCM output. Asterisk
-   generates idle silence; `MEDIA_XOFF` pauses queue consumption until `MEDIA_XON`.
-5. Hangup closes the socket, stops playback/translators, frees the call, and lets
-   the same browser join the next call.
-
-For a later hosted test, change the client's URI to `wss://<app-domain>/media` and
-set `tls_enabled = yes`, keeping certificate and hostname verification enabled.
-The app's HTTP ingress must route WebSocket upgrades to the bridge's HTTP port.
-This is a local POC: the media endpoint is currently unauthenticated; access control
-must be added before exposing it for unrestricted remote use.
-
-Protocol/config reference: [Asterisk native media WebSocket](https://docs.asterisk.org/Configuration/Channel-Drivers/WebSocket/).
-
-## Out of scope
-
-Multiple simultaneous calls, WS auth, DTMF/IVR, recording, remote agent UI, Asterisk
-hardening (TLS/ACL).
-
-## Latency tuning for the Render POC
-
-The bridge still runs on the existing free Render service. No hosting migration is
-required for these changes. Open the agent page and wait for it to connect before
-placing the demo call; this keeps initial service startup separate from call timing.
+These browser/PTT settings apply to the legacy AudioSocket demo. Open the agent
+page and wait for it to connect before placing that demo call.
 
 Optional environment variables (defaults apply without editing Render settings):
 
