@@ -90,9 +90,28 @@ Dial **5001** only if you want to compare the legacy AudioSocket connection.
 Hang up → bridge logs `closed, duration Ns`; `curl localhost:8080/health` shows
 `activeCalls: 0`.
 
+## Asterisk media translation test
+
+Native Asterisk `/media` defaults to `MEDIA_MODE=translation`. It streams 8kHz call
+audio into the existing Gemini Live translator, logs source transcription and
+translated text, synthesizes translated speech, and sends the 8kHz audio back through
+the same Asterisk media connection. Set `MEDIA_SOURCE_LANG=hi` and
+`MEDIA_TARGET_LANG=en` for Hindi-to-English, or reverse these for English-to-Hindi.
+This tests one source-to-target direction on an Asterisk call; it does not pair
+customer and agent legs or return opposite translations to each participant.
+For this test, set `MEDIA_MODE=translation`, `MEDIA_SOURCE_LANG=hi`, and
+`MEDIA_TARGET_LANG=en` in the DigitalOcean component's runtime environment, then
+redeploy. Call through the Asterisk ARI flow. Runtime Logs should show
+`mode=translation`, `translation ready`, `[stt ...]` source text,
+`[translation ...]` translated text, and non-zero `sentBytes` at hangup.
+
+This uses the repo's existing Gemini Live API key. It is not a separate Google Cloud
+Streaming STT integration. The Live model provides transcription and translated audio
+in the same streaming session.
+
 ## Temporary phone loopback test
 
-Set the bridge's runtime environment variable `MEDIA_LOOPBACK=true` and restart or
+Set the bridge's runtime environment variable `MEDIA_MODE=loopback` and restart or
 redeploy it. The `/media` handler then echoes each received binary PCM message back
 to the same Asterisk connection, without creating Gemini translation sessions.
 Rajiv bhai should hear the original voice back on the phone with network delay.
@@ -106,8 +125,8 @@ Text control messages are never echoed. During Asterisk's `MEDIA_XOFF`, live ech
 audio is discarded and counted as `droppedBytes`; sending resumes on `MEDIA_XON`.
 
 For DigitalOcean, add the variable to the translation component's runtime environment
-in Settings and let it redeploy after this code has been deployed. Set it to `false`
-or remove it and redeploy to restore translation. Loopback is off by default.
+in Settings and let it redeploy after this code has been deployed. Set `MEDIA_MODE=translation`
+to restore translation. Loopback is off by default.
 Do not connect Asterisk's `Echo` application to this mode: use a normal phone call,
 otherwise both sides can repeatedly echo the same audio.
 
