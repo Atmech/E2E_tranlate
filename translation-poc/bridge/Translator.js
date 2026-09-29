@@ -19,7 +19,7 @@ const CHUNK_SAMPLES = Number(process.env.GEMINI_CHUNK_SAMPLES || 320);
 
 if (!Number.isInteger(CHUNK_SAMPLES) || CHUNK_SAMPLES < 1 || CHUNK_SAMPLES > 16000)
   throw new Error('GEMINI_CHUNK_SAMPLES must be an integer between 1 and 16000');
-const ai = new GoogleGenAI({ apiKey: API_KEY });
+let ai; // Create only when starting translation; offline transport tests need no key.
 
 // BCP-47 code -> human name, so the systemInstruction prompt is unambiguous about the
 // SOURCE language (the dedicated translate model auto-detects and can mis-detect dialectal
@@ -33,13 +33,14 @@ const langName = (code) => LANG_NAMES[code] || code;
 
 export class Translator {
   // onAudio(Int16Array@24k), onInputText(str), onOutputText(str), onTurnEnd()
-  constructor(targetLang, { sourceLang, onAudio, onInputText, onOutputText, onTurnEnd } = {}) {
+  constructor(targetLang, { sourceLang, onAudio, onInputText, onOutputText, onTurnEnd, onFailure } = {}) {
     this.targetLang = targetLang;
     this.sourceLang = sourceLang || null;
     this.onAudio = onAudio || (() => {});
     this.onInputText = onInputText || (() => {});
     this.onOutputText = onOutputText || (() => {});
     this.onTurnEnd = onTurnEnd || (() => {});
+    this.onFailure = onFailure || (() => {});
     this.session = null;
     this.pending = new Int16Array(0);
     this.closed = false;
@@ -70,6 +71,8 @@ export class Translator {
   }
 
   async start() {
+    if (this.closed) return;
+    ai ||= new GoogleGenAI({ apiKey: API_KEY });
     const started = performance.now();
     const session = await ai.live.connect({
       model: MODEL,
@@ -77,11 +80,15 @@ export class Translator {
       callbacks: {
         onopen: () => console.log(`[translator ${this.targetLang}] open`),
         onmessage: (m) => this._onMessage(m),
-        onerror: (e) => console.error(`[translator ${this.targetLang}] error:`, e?.message || e),
+        onerror: (e) => {
+          console.error(`[translator ${this.targetLang}] error:`, e?.message || e);
+          if (!this.closed) this.onFailure(e);
+        },
         onclose: (e) => {
           this._cancelInputTail();
           this.session = null;
           console.log(`[translator ${this.targetLang}] close`, e?.reason || '');
+          if (!this.closed) this.onFailure(new Error('Translation connection closed'));
         },
       },
     });

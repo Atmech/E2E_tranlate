@@ -15,7 +15,7 @@ const marker = Buffer.alloc(320);
 for (let i = 0; i < 160; i++) marker.writeInt16LE(Math.round(3000 * Math.sin(2 * Math.PI * 440 * i / 8000)), i * 2);
 let current;
 wss.on('connection', ws => handleNativeConnection(ws, {
-  activeCalls, agents: new Set(),
+  activeCalls, agents: new Set(), mode: 'mock',
   createBridge: (id, sock, { pacer }) => ({
     async init() {
       current.id = id;
