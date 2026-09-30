@@ -44,6 +44,7 @@ export class CallTranslationSession {
     const peer = this.legs.get(opposite(role));
     if (peer && (peer.sourceLang !== targetLang || peer.targetLang !== sourceLang))
       throw new Error('Caller and agent languages must be reciprocal');
+    pacer.label = `${callId} ${opposite(role)}->${role}`;
     this.legs.set(role, { sourceLang, targetLang, sock, pacer, droppedBytes: 0 });
     console.log(`[media ${callId}] joined role=${role} ${sourceLang}->${targetLang}`);
     // Defer startup until the handler has installed its connection cleanup adapter.
@@ -70,7 +71,7 @@ export class CallTranslationSession {
             if (this.closed) return;
             const pcm8 = int16ToBuf(pcm24kTo8k(pcm24));
             // Bound memory even when the recipient remains paused with MEDIA_XOFF.
-            if (destination.pacer.queue.length + pcm8.length > 16000 * 30)
+            if (destination.pacer.queuedBytes + pcm8.length > 16000 * 30)
               return this.close('Playback queue exceeded thirty seconds', 1011);
             destination.pacer.push(pcm8);
           },
