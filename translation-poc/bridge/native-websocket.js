@@ -69,16 +69,20 @@ export function handleNativeConnection(ws, { activeCalls, agents = new Set(), cr
         if (mode === 'translation') {
           const metadata = readMediaMetadata(event.channel_variables);
           let session = activeCalls.get(metadata.callId);
-          if (session && !(session instanceof CallTranslationSession)) return fail('Single-call POC is busy');
+          if (session && !(session instanceof CallTranslationSession)) return fail('CALL_ID collision');
           if (!session) {
-            if (activeCalls.size) return fail('Single-call POC is busy');
+            // Each CALL_ID owns an independent caller/agent pair and translators.
             session = new CallTranslationSession(metadata.callId, {
               createTranslator, setupTimeoutMs,
               onClose: () => {
-                if (activeCalls.get(metadata.callId) === session) activeCalls.delete(metadata.callId);
+                if (activeCalls.get(metadata.callId) === session) {
+                  activeCalls.delete(metadata.callId);
+                  console.log(`[media ${metadata.callId}] session removed activeCalls=${activeCalls.size}`);
+                }
               },
             });
             activeCalls.set(metadata.callId, session);
+            console.log(`[media ${metadata.callId}] new translation session activeCalls=${activeCalls.size}`);
           }
           const pacer = new OutputPacer(sock, { encodeFrame: pcm => pcm, sendSilence: false });
           bridge = session.addLeg(metadata, sock, pacer);

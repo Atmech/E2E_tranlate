@@ -85,7 +85,7 @@ for (const firstRole of ['caller', 'agent']) test(`pair ${firstRole} first; tran
   assert.equal(agent.sent.length, 1, 'late model output ignored after hangup');
 });
 
-test('missing metadata is rejected; duplicate role, wrong languages and other calls preserve valid peer', async t => {
+test('missing metadata is rejected; duplicate role and wrong languages preserve valid peer', async t => {
   const h = harness(t);
   for (const overrides of [{ CALL_ID: '' }, { ROLE: 'other' }, { SOURCE_LANG: '' }, { TARGET_LANG: undefined }]) {
     assert.equal(h.connect('caller', overrides).closeCode, 1008);
@@ -95,7 +95,7 @@ test('missing metadata is rejected; duplicate role, wrong languages and other ca
   missing.control({ ...mediaStart('caller'), channel_variables: undefined });
   assert.equal(missing.closeCode, 1008);
   const caller = h.connect('caller'), original = h.session();
-  for (const [role, overrides] of [['caller', {}], ['agent', { SOURCE_LANG: 'fr' }], ['agent', { CALL_ID: 'other-call' }]]) {
+  for (const [role, overrides] of [['caller', {}], ['agent', { SOURCE_LANG: 'fr' }]]) {
     assert.equal(h.connect(role, overrides).closeCode, 1008);
     assert.equal(h.session(), original);
     assert.equal(caller.readyState, 1);
@@ -105,6 +105,67 @@ test('missing metadata is rejected; duplicate role, wrong languages and other ca
   agent.close(1000);
   h.connect('caller'); h.connect('agent'); await settle();
   assert.equal(h.session().ready, true, 'next call can reuse IDs after full teardown');
+});
+
+for (const ending of ['hangup', 'translator failure']) test(`concurrent calls isolate audio and cleanup on ${ending}`, async t => {
+  const h = harness(t);
+  // Interleave setup, with opposite roles arriving first and identical transport IDs.
+  const callerA = h.connect('caller');
+  const agentB = h.connect('agent', { CALL_ID: 'call-b' });
+  const agentA = h.connect('agent');
+  const callerB = h.connect('caller', { CALL_ID: 'call-b' });
+  await settle();
+  assert.equal(h.activeCalls.size, 2);
+  const a = h.session(), b = h.activeCalls.get('call-b');
+  assert.ok(a.ready && b.ready);
+  assert.equal(new Set(h.translators).size, 4);
+
+  const routes = [
+    [a, 'caller', callerA, agentA, 1100],
+    [a, 'agent', agentA, callerA, -1200],
+    [b, 'caller', callerB, agentB, 2100],
+    [b, 'agent', agentB, callerB, -2200],
+  ];
+  for (const [session, role, source, destination, value] of routes) {
+    const translator = session.legs.get(role).translator;
+    const feedCounts = h.translators.map(tr => tr.feeds.length);
+    source.audio(Buffer.alloc(320, 1));
+    h.translators.forEach((tr, i) =>
+      assert.equal(tr.feeds.length, feedCounts[i] + (tr === translator ? 1 : 0)));
+    output(translator, value);
+    session.legs.get(role === 'caller' ? 'agent' : 'caller').pacer._tick();
+    assert.equal(destination.sent.length, 1);
+    assert.equal(destination.sent[0].data.readInt16LE(0), value);
+  }
+  assert.equal(h.connect('caller', { CALL_ID: 'call-b' }).closeCode, 1008);
+  assert.ok(a.ready && b.ready, 'duplicate participant must not close either call');
+
+  if (ending === 'hangup') callerA.close(1000);
+  else a.legs.get('caller').translator.callbacks.onFailure(new Error('test failure'));
+  assert.equal(callerA.readyState, 3);
+  assert.equal(agentA.readyState, 3);
+  assert.equal(h.activeCalls.size, 1);
+  assert.equal(h.activeCalls.get('call-b'), b);
+  for (const leg of a.legs.values()) {
+    assert.equal(leg.translator.closed, true);
+    assert.equal(leg.pacer.timer, null);
+  }
+  assert.ok(b.ready);
+  assert.equal(callerB.readyState, 1);
+  assert.equal(agentB.readyState, 1);
+  assert.ok([...b.legs.values()].every(leg => !leg.translator.closed));
+  callerB.audio(Buffer.alloc(320));
+  assert.equal(b.legs.get('caller').translator.feeds.length, 2);
+  output(b.legs.get('caller').translator, 3100);
+  b.legs.get('agent').pacer._tick();
+  assert.equal(agentB.sent[1].data.readInt16LE(0), 3100);
+});
+
+test('CALL_ID collision preserves an existing incompatible bridge', t => {
+  const h = harness(t), existing = {};
+  h.activeCalls.set('abc123', existing);
+  assert.equal(h.connect('caller').closeCode, 1008);
+  assert.equal(h.session(), existing);
 });
 
 test('recipient XOFF pauses only recipient output; XON resumes exact queued audio', async t => {

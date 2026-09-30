@@ -73,8 +73,10 @@ Agent uses the same event format, with:
 - Audio arriving before `translation ready` is dropped and counted at hangup.
   Start speaking after readiness during testing. There is no custom readiness
   control message sent to Asterisk.
-- A missing/invalid field or duplicate role rejects that new connection. An unrelated
-  concurrent call is rejected; this remains a one-call POC (two sockets per call).
+- A missing/invalid field or duplicate role rejects that new connection.
+  Concurrent native translation calls are supported: each unique `CALL_ID` owns
+  two sockets and two independent translators. Calls share the server's resources
+  and Gemini account limits; no concurrent-call capacity has been load-tested.
 - If either participant disconnects, startup times out, or a translator fails,
   both sockets and translators close. Reconnecting requires a fresh pair.
 - `MEDIA_XOFF` pauses output only to that participant; `MEDIA_XON` resumes it.
@@ -102,7 +104,9 @@ is complete before testing. Restarting the process ends active calls.
    hears their own translated voice and translated playback does not start another
    translation cycle.
 5. Hang up either side: both sockets close; `/health` returns `activeCalls: 0`.
-   Repeat with another call to check cleanup.
+   Repeat with another call to check cleanup. Also run two calls simultaneously
+   with different `CALL_ID`s: verify each participant hears only their own peer's
+   translation, then end one call and confirm the other continues in both directions.
 
 The `/media` endpoint remains unauthenticated in this POC. Call IDs identify sessions;
 they are not credentials. Production authentication and multi-instance routing are
