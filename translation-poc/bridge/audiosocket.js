@@ -54,87 +54,179 @@ const MAX_WAIT_MS = milliseconds('PACER_MAX_WAIT_MS', 120);
 const END_GAP_MS = milliseconds('PACER_END_GAP_MS', 200);
 const SILENCE_FRAME = Buffer.alloc(BYTES_PER_FRAME);
 
+// Proposed buffer optimization based on Rajiv's frame queue.
+// Default: preserve speech. Optional trimming deliberately discards old audio.
 export class OutputPacer {
   constructor(sock, { now = () => performance.now(), prebufferMs = PREBUFFER_MS,
     maxWaitMs = MAX_WAIT_MS, endGapMs = END_GAP_MS,
-    encodeFrame = buildAudioFrame, sendSilence = true } = {}) {
-    this.sock = sock;
-    this.encodeFrame = encodeFrame;
-    this.sendSilence = sendSilence;
-    this.now = now;
+    encodeFrame = buildAudioFrame, sendSilence = true,
+    warnBacklogMs = 3000, maxBacklogMs = 6000, targetBacklogMs = 3000,
+    trimBacklog = false, label = 'unlabelled', logIntervalMs = 5000 } = {}) {
+    for (const [name, value] of Object.entries({ warnBacklogMs, maxBacklogMs, targetBacklogMs })) {
+      if (!Number.isFinite(value) || value < 20 || value > 30000)
+        throw new Error(`${name} must be between 20 and 30000 milliseconds`);
+    }
+    if (targetBacklogMs > maxBacklogMs || warnBacklogMs > maxBacklogMs)
+      throw new Error('Backlog target and warning must not exceed maximum');
+    if (typeof trimBacklog !== 'boolean') throw new Error('trimBacklog must be boolean');
+    if (!Number.isFinite(logIntervalMs) || logIntervalMs < 0)
+      throw new Error('logIntervalMs must be nonnegative; zero disables periodic logging');
+    Object.assign(this, { sock, now, maxWaitMs, endGapMs, encodeFrame, sendSilence,
+      trimBacklog, label, logIntervalMs });
     this.prebufferBytes = Math.ceil(prebufferMs / 20) * BYTES_PER_FRAME;
-    this.maxWaitMs = maxWaitMs;
-    this.endGapMs = endGapMs;
+    this.warnBacklogBytes = Math.ceil(warnBacklogMs / 20) * BYTES_PER_FRAME;
+    this.maxBacklogBytes = Math.ceil(maxBacklogMs / 20) * BYTES_PER_FRAME;
+    this.targetBacklogFrames = Math.ceil(targetBacklogMs / 20);
     this.timer = null;
-    this.stats = { audioFrames: 0, silenceFrames: 0, maxQueueMs: 0, maxStartWaitMs: 0 };
+    this.startedAt = null;
+    this.lastTickAt = null;
+    this.lastLogAt = null;
+    this.wasBlocked = false;
+    this.stats = { audioFrames: 0, silenceFrames: 0, maxQueueMs: 0, maxStartWaitMs: 0,
+      inputAudioMs: 0, submittedAudioMs: 0, maxInputChunkMs: 0,
+      backlogWarnings: 0, backlogTrims: 0, droppedFrames: 0, droppedMs: 0,
+      maxTickGapMs: 0, delayedTicks: 0, observedBlockedMs: 0 };
     this.flush();
   }
 
-  commit() { this.committed = this.queue.length > 0; }
+  get queuedFrames() { return this.frames.length - this.head; }
+  get queuedBytes() { return this.queuedFrames * BYTES_PER_FRAME + this.partial.length; }
+  get queuedMs() { return this.queuedBytes / 16; }
+  // Compatibility snapshot for existing inspection/tests. Runtime uses queuedBytes
+  // to avoid allocating and copying the backlog just to inspect its size.
+  get queue() { return Buffer.concat([...this.frames.slice(this.head), this.partial], this.queuedBytes); }
 
+  commit() { this.committed = this.queuedBytes > 0; }
   start() {
-    if (!this.timer) this.timer = setInterval(() => this._tick(), 20);
+    if (this.timer) return;
+    this.startedAt = this.now();
+    this.lastTickAt = this.startedAt;
+    this.lastLogAt = this.startedAt;
+    this.wasBlocked = this.sock?.writable === false;
+    this.timer = setInterval(() => this._tick(), 20);
   }
 
   push(buf) {
-    if (!buf.length) return;
+    if (!buf?.length) return;
+    if (buf.length % 2) throw new Error('PCM must contain complete 16-bit samples');
     const now = this.now();
-    if (!this.queue.length) this.queuedAt = now;
+    if (!this.queuedBytes) this.queuedAt = now;
     this.lastPushAt = now;
-    this.queue = this.queue.length ? Buffer.concat([this.queue, buf]) : buf;
-    this.stats.maxQueueMs = Math.max(this.stats.maxQueueMs, this.queue.length / 16);
+    this.stats.inputAudioMs += buf.length / 16;
+    this.stats.maxInputChunkMs = Math.max(this.stats.maxInputChunkMs, buf.length / 16);
+    let offset = 0;
+    if (this.partial.length) {
+      const needed = BYTES_PER_FRAME - this.partial.length;
+      if (buf.length < needed) {
+        this.partial = Buffer.concat([this.partial, buf]);
+        this._checkBacklog(now);
+        return;
+      }
+      const frame = Buffer.allocUnsafe(BYTES_PER_FRAME);
+      this.partial.copy(frame);
+      buf.copy(frame, this.partial.length, 0, needed);
+      this.frames.push(frame);
+      this.partial = Buffer.alloc(0);
+      offset = needed;
+    }
+    for (; offset + BYTES_PER_FRAME <= buf.length; offset += BYTES_PER_FRAME)
+      this.frames.push(buf.subarray(offset, offset + BYTES_PER_FRAME));
+    if (offset < buf.length) this.partial = Buffer.from(buf.subarray(offset));
+    this._checkBacklog(now);
   }
 
+  _checkBacklog(now) {
+    this.stats.maxQueueMs = Math.max(this.stats.maxQueueMs, this.queuedMs);
+    if (this.queuedBytes >= this.warnBacklogBytes && !this.backlogWarningActive) {
+      this.backlogWarningActive = true;
+      this.stats.backlogWarnings++;
+      console.warn(`[pacer ${this.label}] backlog`, { queuedMs: this.queuedMs, trimBacklog: this.trimBacklog });
+    }
+    if (this.trimBacklog && this.queuedBytes > this.maxBacklogBytes) {
+      const count = Math.max(0, this.queuedFrames - this.targetBacklogFrames);
+      this.head += count;
+      this.stats.backlogTrims++;
+      this.stats.droppedFrames += count;
+      this.stats.droppedMs += count * 20;
+      this.queuedAt = now;
+      this._compactFrames();
+      console.warn(`[pacer ${this.label}] SPEECH DISCARDED`, { droppedMs: count * 20, remainingMs: this.queuedMs });
+    }
+    if (this.queuedBytes < this.warnBacklogBytes) this.backlogWarningActive = false;
+  }
+
+  _compactFrames() {
+    if (this.head && (this.head >= 1024 || this.head >= this.frames.length / 2)) {
+      this.frames = this.frames.slice(this.head);
+      this.head = 0;
+    }
+  }
   flush() {
-    this.queue = Buffer.alloc(0);
+    this.frames = [];
+    this.head = 0;
+    this.partial = Buffer.alloc(0);
     this.draining = false;
     this.silenceRun = 0;
     this.queuedAt = null;
     this.lastPushAt = null;
     this.committed = false;
+    this.backlogWarningActive = false;
   }
-
   _write(frame) {
     if (this.sock && !this.sock.destroyed && this.sock.writable)
       this.sock.write(this.encodeFrame(frame));
   }
-
   _writeSilence() {
     if (!this.sendSilence) return;
     this.stats.silenceFrames++;
     this._write(SILENCE_FRAME);
   }
-
+  _report(now, event) {
+    console.log(`[pacer ${this.label}] ${event}`, { ...this.stats,
+      queuedMs: this.queuedMs, elapsedMs: this.startedAt === null ? null : now - this.startedAt });
+  }
   _tick() {
-    // Native WebSocket MEDIA_XOFF pauses consumption as well as writes.
-    if (this.sock?.writable === false || this.sock?.destroyed) return;
     const now = this.now();
+    if (this.lastTickAt !== null) {
+      const gap = Math.max(0, now - this.lastTickAt);
+      this.stats.maxTickGapMs = Math.max(this.stats.maxTickGapMs, gap);
+      if (gap > 40) this.stats.delayedTicks++;
+      // Sampled blocked duration, not an exact XOFF event timestamp.
+      if (this.wasBlocked) this.stats.observedBlockedMs += gap;
+    }
+    this.lastTickAt = now;
+    this.wasBlocked = this.sock?.writable === false;
+    if (this.logIntervalMs && this.lastLogAt !== null && now - this.lastLogAt >= this.logIntervalMs) {
+      this._report(now, 'playback sample');
+      this.lastLogAt = now;
+    }
+    if (this.wasBlocked || this.sock?.destroyed) return;
     if (!this.draining) {
-      // Asterisk closes an AudioSocket call after two seconds without incoming
-      // frames. Keep the socket active while translation is starting or idle.
-      if (!this.queue.length) { this._writeSilence(); return; }
+      if (!this.queuedBytes) { this._writeSilence(); return; }
       const waited = now - this.queuedAt;
-      if (!this.committed && this.queue.length < this.prebufferBytes && waited < this.maxWaitMs) {
-        this._writeSilence();
-        return;
+      if (!this.committed && this.queuedBytes < this.prebufferBytes && waited < this.maxWaitMs) {
+        this._writeSilence(); return;
       }
       this.stats.maxStartWaitMs = Math.max(this.stats.maxStartWaitMs, waited);
       this.draining = true;
       this.silenceRun = 0;
     }
-    // A partial final frame must not wait forever, even without a model turn-end.
     const tailReady = this.committed || now - this.lastPushAt >= this.maxWaitMs;
-    if (this.queue.length >= BYTES_PER_FRAME || (this.queue.length && tailReady)) {
-      const count = Math.min(this.queue.length, BYTES_PER_FRAME);
-      let frame = this.queue.subarray(0, count);
-      if (count < BYTES_PER_FRAME) {
-        frame = Buffer.alloc(BYTES_PER_FRAME);
-        this.queue.copy(frame);
-      }
-      this.queue = this.queue.subarray(count);
-      if (!this.queue.length) { this.queuedAt = null; this.committed = false; }
+    let frame;
+    if (this.queuedFrames) {
+      frame = this.frames[this.head++];
+      this._compactFrames();
+    } else if (this.partial.length && tailReady) {
+      frame = Buffer.alloc(BYTES_PER_FRAME);
+      this.partial.copy(frame);
+      this.partial = Buffer.alloc(0);
+    }
+    if (frame) {
+      if (!this.queuedBytes) { this.queuedAt = null; this.committed = false; }
+      if (this.queuedBytes < this.warnBacklogBytes) this.backlogWarningActive = false;
       this.silenceRun = 0;
       this.stats.audioFrames++;
+      this.stats.submittedAudioMs += 20;
       this._write(frame);
     } else {
       this.silenceRun += 20;
@@ -142,11 +234,11 @@ export class OutputPacer {
       this._writeSilence();
     }
   }
-
   stop() {
     if (this.timer) clearInterval(this.timer);
     this.timer = null;
-    console.log('[pacer] playback stats', this.stats);
+    this._report(this.now(), 'playback stats');
+    this.lastTickAt = null;
     this.flush();
   }
 }
