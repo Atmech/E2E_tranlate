@@ -78,6 +78,8 @@ export class OutputPacer {
     this.maxBacklogBytes = Math.ceil(maxBacklogMs / 20) * BYTES_PER_FRAME;
     this.targetBacklogFrames = Math.ceil(targetBacklogMs / 20);
     this.timer = null;
+    this.running = false;
+    this.nextTickAt = null;
     this.startedAt = null;
     this.lastTickAt = null;
     this.lastLogAt = null;
@@ -98,12 +100,31 @@ export class OutputPacer {
 
   commit() { this.committed = this.queuedBytes > 0; }
   start() {
-    if (this.timer) return;
+    if (this.running) return;
+    this.running = true;
     this.startedAt = this.now();
     this.lastTickAt = this.startedAt;
     this.lastLogAt = this.startedAt;
     this.wasBlocked = this.sock?.writable === false;
-    this.timer = setInterval(() => this._tick(), 20);
+    this.nextTickAt = this.startedAt + 20;
+    this._scheduleNextTick();
+  }
+
+  _scheduleNextTick() {
+    if (!this.running) return;
+    const delay = Math.max(0, Math.ceil(this.nextTickAt - this.now()));
+    this.timer = setTimeout(() => {
+      this.timer = null;
+      if (!this.running) return;
+      const scheduledAt = this.nextTickAt;
+      const lateness = Math.max(0, this.now() - scheduledAt);
+      this._tick(); // At most one frame per callback, including after a stall.
+      if (!this.running) return;
+      // Correct small delays against the original clock. After missing a whole
+      // period, re-anchor instead of rapidly submitting all the missed frames.
+      this.nextTickAt = lateness < 20 ? scheduledAt + 20 : this.now() + 20;
+      this._scheduleNextTick();
+    }, delay);
   }
 
   push(buf) {
@@ -235,8 +256,10 @@ export class OutputPacer {
     }
   }
   stop() {
-    if (this.timer) clearInterval(this.timer);
+    this.running = false;
+    if (this.timer) clearTimeout(this.timer);
     this.timer = null;
+    this.nextTickAt = null;
     this._report(this.now(), 'playback stats');
     this.lastTickAt = null;
     this.flush();
