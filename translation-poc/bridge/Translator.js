@@ -181,6 +181,7 @@ export class Translator {
       } catch (e) {
         this._cancelInputTail();
         console.error(`[translator ${this.targetLang}] input tail failed:`, e?.message || e);
+        if (!this.closed) this.onFailure(e);
       }
     }, INPUT_TAIL_MS);
   }

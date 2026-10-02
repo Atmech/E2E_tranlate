@@ -13,6 +13,8 @@ import { WebSocketServer } from 'ws';
 import { createParser, FRAME } from './audiosocket.js';
 import { CallBridge } from './CallBridge.js';
 import { handleNativeConnection } from './native-websocket.js';
+import { CallMonitor } from './CallMonitor.js';
+import { createMonitorHandler } from './monitor-http.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const UI_DIR = path.join(__dirname, '..', 'agent-ui');
@@ -29,6 +31,8 @@ if (!process.env.GEMINI_API_KEY) {
 
 const activeCalls = new Map(); // callId -> legacy CallBridge or paired CallTranslationSession
 const agents = new Set();      // currently connected agent WS sockets
+const monitor = new CallMonitor();
+const handleMonitor = createMonitorHandler(monitor);
 
 // ---- AudioSocket TCP server (Asterisk connects here) ----
 const tcp = net.createServer((sock) => {
@@ -43,10 +47,11 @@ const tcp = net.createServer((sock) => {
         callId = payload.toString('hex');
         if (activeCalls.size > 0) {
           console.warn('[as] rejecting concurrent call: single-call POC');
+          monitor.event(null, 'warning', 'Legacy TCP call rejected: another call is active');
           sock.end();
           return;
         }
-        bridge = new CallBridge(callId, sock);
+        bridge = new CallBridge(callId, sock, { monitor });
         activeCalls.set(callId, bridge);
         console.log(`[as] call up: ${callId}`);
         try {
@@ -55,7 +60,8 @@ const tcp = net.createServer((sock) => {
           for (const agentWs of agents) bridge.attachAgent(agentWs);
         } catch (e) {
           console.error(`[as] init failed for ${callId}:`, e?.message || e);
-          bridge.close();
+          bridge.reportFailure?.('caller', e);
+          bridge.close('Translator setup failed', true);
           if (activeCalls.get(callId) === bridge) activeCalls.delete(callId);
           sock.destroy();
         }
@@ -72,6 +78,7 @@ const tcp = net.createServer((sock) => {
         sock.end();
         break;
       case FRAME.ERROR:
+        monitor.event(bridge?.monitorId, 'error', 'Asterisk AudioSocket error frame');
         console.error(`[as] error frame ${callId}:`, payload);
         break;
       default:
@@ -88,23 +95,34 @@ const tcp = net.createServer((sock) => {
   };
   sock.on('end', teardown);
   sock.on('close', teardown);
-  sock.on('error', (e) => { console.error('[as] socket error:', e?.message || e); teardown(); });
+  sock.on('error', (e) => {
+    console.error('[as] socket error:', e?.message || e);
+    if (bridge) bridge.close('AudioSocket transport error', true);
+    else monitor.event(null, 'error', 'AudioSocket transport error before call setup');
+    teardown();
+  });
 });
 
 tcp.listen(AS_PORT, () => console.log(`audiosocket on :${AS_PORT}`));
 
 // ---- HTTP server (health + static UI) ----
 const MIME = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css' };
-const httpServer = http.createServer((req, res) => {
+const httpServer = http.createServer(async (req, res) => {
+  try { if (await handleMonitor(req, res)) return; }
+  catch {
+    if (!res.headersSent) res.writeHead(500, { 'content-type': 'text/plain', 'cache-control': 'no-store' });
+    res.end('Monitor unavailable'); return;
+  }
   if (req.url === '/health') {
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end(JSON.stringify({ status: 'ok', activeCalls: activeCalls.size }));
     return;
   }
   // static serve agent-ui/
-  const rel = req.url === '/' ? '/index.html' : req.url.split('?')[0];
-  const file = path.join(UI_DIR, path.normalize(rel));
-  if (!file.startsWith(UI_DIR)) { res.writeHead(403); res.end(); return; }
+  const pathname = new URL(req.url, 'http://localhost').pathname;
+  // The legacy demo has one public file. Never expose monitor assets or sibling directories.
+  if (!['/', '/index.html'].includes(pathname)) { res.writeHead(404); res.end('not found'); return; }
+  const file = path.join(UI_DIR, 'index.html');
   fs.readFile(file, (err, data) => {
     if (err) { res.writeHead(404); res.end('not found'); return; }
     res.writeHead(200, { 'content-type': MIME[path.extname(file)] || 'application/octet-stream' });
@@ -156,7 +174,8 @@ const asWss = new WebSocketServer({ noServer: true });
 // Native chan_websocket uses raw PCM and text control events, not AudioSocket frames.
 const mediaWss = new WebSocketServer({ noServer: true, maxPayload: 65500 });
 mediaWss.on('connection', ws => handleNativeConnection(ws, {
-  activeCalls, agents, createBridge: (...args) => new CallBridge(...args),
+  activeCalls, agents, monitor,
+  createBridge: (id, sock, options) => new CallBridge(id, sock, { ...options, monitor }),
 }));
 
 // Single upgrade handler routes by pathname to the right WS server.
@@ -192,10 +211,11 @@ asWss.on('connection', (ws) => {
         callId = payload.toString('hex');
         if (activeCalls.size > 0) {
           console.warn('[asws] rejecting concurrent call: single-call POC');
+          monitor.event(null, 'warning', 'Legacy relay call rejected: another call is active');
           ws.close();
           return;
         }
-        bridge = new CallBridge(callId, sockShim);
+        bridge = new CallBridge(callId, sockShim, { monitor });
         activeCalls.set(callId, bridge);
         console.log(`[asws] call up: ${callId}`);
         try {
@@ -203,7 +223,8 @@ asWss.on('connection', (ws) => {
           for (const agentWs of agents) bridge.attachAgent(agentWs);
         } catch (e) {
           console.error(`[asws] init failed for ${callId}:`, e?.message || e);
-          bridge.close();
+          bridge.reportFailure?.('caller', e);
+          bridge.close('Translator setup failed', true);
           if (activeCalls.get(callId) === bridge) activeCalls.delete(callId);
           ws.close();
         }
@@ -212,7 +233,9 @@ asWss.on('connection', (ws) => {
       case FRAME.AUDIO: bridge?.onCallAudio(payload); break;
       case FRAME.DTMF: console.log(`[asws] dtmf ${callId}:`, payload.toString('ascii')); break;
       case FRAME.HANGUP: teardown(); ws.close(); break;
-      case FRAME.ERROR: console.error(`[asws] error frame ${callId}:`, payload); break;
+      case FRAME.ERROR:
+        monitor.event(bridge?.monitorId, 'error', 'Asterisk relay error frame');
+        console.error(`[asws] error frame ${callId}:`, payload); break;
       default: break;
     }
   });
@@ -226,7 +249,12 @@ asWss.on('connection', (ws) => {
     }
   };
   ws.on('close', teardown);
-  ws.on('error', (e) => { console.error('[asws] error:', e?.message || e); teardown(); });
+  ws.on('error', (e) => {
+    console.error('[asws] error:', e?.message || e);
+    if (bridge) bridge.close('Relay transport error', true);
+    else monitor.event(null, 'error', 'Relay transport error before call setup');
+    teardown();
+  });
   console.log('[asws] relay connected');
 });
 

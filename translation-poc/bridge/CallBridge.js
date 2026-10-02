@@ -5,6 +5,7 @@
 // CUSTOMER_LANG; agent hears it in AGENT_LANG.
 import WebSocket from 'ws';
 import { Translator } from './Translator.js';
+import { failureCause } from './CallMonitor.js';
 import { OutputPacer } from './audiosocket.js';
 import { bufToInt16, pcm8kTo16k, pcm24kTo8k, int16ToBuf, b64ToInt16, int16ToB64 } from './audio.js';
 
@@ -14,7 +15,7 @@ const AGENT_CHUNK_MS = Number(process.env.AGENT_CHUNK_MS || 20);
 if (![20, 40, 100].includes(AGENT_CHUNK_MS)) throw new Error('AGENT_CHUNK_MS must be 20, 40, or 100');
 
 export class CallBridge {
-  constructor(callId, sock, { pacer = new OutputPacer(sock) } = {}) {
+  constructor(callId, sock, { pacer = new OutputPacer(sock), monitor } = {}) {
     this.callId = callId;
     this.sock = sock;             // customer TCP socket or WebSocket adapter
     this.agentWs = null;          // agent browser WS
@@ -23,6 +24,16 @@ export class CallBridge {
     this.agentTalking = false;    // PTT state
     this.closed = false;
     this.ready = false;
+    this.monitor = monitor;
+    this.monitorId = monitor?.start(callId, 'legacy');
+    monitor?.watch(this.monitorId, () => ({ caller: { queueMs: Math.round(this.pacer.queuedMs || 0),
+      maxQueueMs: Math.round(this.pacer.stats?.maxQueueMs || 0) } }));
+    this.received = { caller: 0, agent: 0 };
+    monitor?.update(this.monitorId, { state: 'starting' });
+    monitor?.leg(this.monitorId, 'caller', { connected: true, sourceLang: CUSTOMER_LANG,
+      targetLang: AGENT_LANG, translator: 'starting' });
+    monitor?.leg(this.monitorId, 'agent', { connected: false, sourceLang: AGENT_LANG,
+      targetLang: CUSTOMER_LANG, translator: 'starting' });
 
     // customer speech (CUSTOMER_LANG) -> agent hears AGENT_LANG
     this.toAgent = new Translator(AGENT_LANG, {
@@ -31,6 +42,7 @@ export class CallBridge {
       onInputText: (t) => this.sendTranscript('customer', t),
       onOutputText: (t) => this.sendTranscript('agent-hears', t),
       onTurnEnd: () => this.sendUi({ type: 'turn-end', side: 'customer' }),
+      onFailure: error => this.reportFailure('caller', error),
     });
     // agent speech (AGENT_LANG) -> customer hears CUSTOMER_LANG
     this.toCustomer = new Translator(CUSTOMER_LANG, {
@@ -40,6 +52,7 @@ export class CallBridge {
       onOutputText: (t) => this.sendTranscript('customer-hears', t),
       // Release any short tail when a turn-end is available; streaming never depends on it.
       onTurnEnd: () => { this.pacer.commit(); this.sendUi({ type: 'turn-end', side: 'agent' }); },
+      onFailure: error => this.reportFailure('agent', error),
     });
   }
 
@@ -48,12 +61,17 @@ export class CallBridge {
     await Promise.all([this.toAgent.start(), this.toCustomer.start()]);
     if (this.closed) return;
     this.ready = true;
+    this.monitor?.update(this.monitorId, { state: 'ready' });
+    for (const role of ['caller', 'agent']) this.monitor?.leg(this.monitorId, role, { translator: 'ready' });
+    this.monitor?.event(this.monitorId, 'info', 'Translators ready');
     console.log(`[bridge ${this.callId}] translators ready (customer ${CUSTOMER_LANG}->agent ${AGENT_LANG}, agent ${AGENT_LANG}->customer ${CUSTOMER_LANG})`);
   }
 
   attachAgent(ws) {
     if (this.closed || !this.ready || this.agentWs === ws) return;
     this.agentWs = ws;
+    this.monitor?.leg(this.monitorId, 'agent', { connected: true });
+    this.monitor?.event(this.monitorId, 'info', 'Browser agent connected', 'agent');
     // Reset PTT on (re)attach: a browser reconnect can leave agentTalking stuck true
     // (missed mouseup before the socket dropped), which silently mutes the customer leg.
     this.agentTalking = false;
@@ -63,6 +81,10 @@ export class CallBridge {
   }
   detachAgent(ws) {
     if (ws && this.agentWs !== ws) return;
+    if (this.agentWs && !this.closed) {
+      this.monitor?.leg(this.monitorId, 'agent', { connected: false });
+      this.monitor?.event(this.monitorId, 'warning', 'Browser agent disconnected', 'agent');
+    }
     if (this.agentTalking) this.toCustomer.endInput();
     if (this.agentWs) console.log(`[bridge ${this.callId}] agent detached`);
     this.agentWs = null;
@@ -86,6 +108,7 @@ export class CallBridge {
   // Raw PCM 16-bit LE 8kHz from either Asterisk transport -> Gemini customer->agent.
   onCallAudio(payload) {
     if (this.closed || this.agentTalking) return;
+    this.recordInput('caller', payload.length);
     const i8 = bufToInt16(payload);
     this.toAgent.feed(pcm8kTo16k(i8));
   }
@@ -93,11 +116,17 @@ export class CallBridge {
   // base64 PCM 16kHz from agent browser mic -> Gemini agent->customer.
   // Browser only sends while PTT is held, so no gate needed here.
   onAgentAudio(b64) {
-    if (!this.closed) this.toCustomer.feed(b64ToInt16(b64));
+    if (!this.closed) {
+      const pcm = b64ToInt16(b64);
+      this.recordInput('agent', pcm.byteLength);
+      this.toCustomer.feed(pcm);
+    }
   }
 
   // translated AGENT_LANG audio (24kHz) -> agent browser.
   sendToAgent(i24) {
+    if (this.closed) return;
+    this.monitor?.leg(this.monitorId, 'caller', { lastOutputAt: Date.now() });
     const ws = this.agentWs;
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({ type: 'audio', rate: 24000, data: int16ToB64(i24) }));
@@ -106,20 +135,37 @@ export class CallBridge {
 
   // translated CUSTOMER_LANG audio (24kHz) -> downsample 8kHz -> pace into the call.
   sendToCall(i24) {
+    if (this.closed) return;
+    this.monitor?.leg(this.monitorId, 'agent', { lastOutputAt: Date.now() });
     this.pacer.push(int16ToBuf(pcm24kTo8k(i24)));
   }
 
   sendTranscript(who, text) {
+    const role = ['customer', 'agent-hears'].includes(who) ? 'caller' : 'agent';
+    const kind = ['agent-hears', 'customer-hears'].includes(who) ? 'translated' : 'recognized';
+    this.monitor?.transcript(this.monitorId, role, kind, text);
     const ws = this.agentWs;
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify({ type: 'transcript', who, text }));
     }
   }
 
-  close() {
+  recordInput(role, bytes) {
+    this.received[role] += bytes;
+    this.monitor?.leg(this.monitorId, role, { receivedBytes: this.received[role], lastInputAt: Date.now() });
+  }
+
+  reportFailure(role, error) {
+    if (this.closed) return;
+    this.monitor?.leg(this.monitorId, role, { translator: 'failed' });
+    this.monitor?.event(this.monitorId, 'error', failureCause(error), role);
+  }
+
+  close(reason = 'Call ended', failed = false) {
     if (this.closed) return;
     this.closed = true;
     this.ready = false;
+    this.monitor?.end(this.monitorId, reason, failed);
     this.sendUi({ type: 'call', state: 'ended' });
     this.toAgent.close();
     this.toCustomer.close();
