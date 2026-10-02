@@ -117,11 +117,14 @@ outside this change.
 ```bash
 npm test                    # offline regressions; fake translators, no network/API key
 npm run test:media-ws        # real localhost WebSockets, fake translator; no Asterisk/Gemini
+npm run test:monitor-http    # real localhost HTTP: auth, SSE, logout and session expiry
 npm run smoke:asterisk-ws    # existing real Asterisk single-connection transport smoke
 ```
 
 The offline tests cover opposite-side audio routing, either connection order,
 metadata rejection, startup/hangup races, model failures, flow control and cleanup.
+They also cover monitor authentication, rate limits, sanitized failure causes,
+bounded history and native-call telemetry.
 The localhost test negotiates `media` and exchanges real WebSocket frames through
 the native handler. Its deterministic fake model verifies routing, not language quality.
 
@@ -144,6 +147,82 @@ During `MEDIA_XOFF`, input is discarded rather than queued.
 Use a normal phone call, not Asterisk Echo, to avoid repeated echoes. Restore
 `MEDIA_MODE=translation` and restart for paired translation. `MEDIA_LOOPBACK=true`
 is supported only when `MEDIA_MODE` is unset; explicit `MEDIA_MODE` takes precedence.
+
+## Private Call Monitor
+
+Open `/monitor` to see active calls, participant and translator status, audio
+activity, playback queues, recent issues, and per-call event timelines. Native
+paired calls, the legacy browser flow, and loopback calls are included. Rejected
+connections appear in the issue feed even when no valid call ID was supplied.
+The monitor is read-only and does not create a browser-agent audio connection.
+
+**Access is disabled by default.** There is no default username or password.
+Leave the monitor settings blank until you are ready to configure access; all
+monitor routes return 503 in that state, while calls continue normally.
+
+### Set credentials later
+
+1. From `translation-poc`, run `npm run monitor:password`. Enter and confirm a
+   password of at least 14 characters. Input is hidden; the command prints only
+   the salted scrypt hash. Do not pass a password as a command-line argument.
+2. Set the following in your deployment's secret environment settings, or your
+   existing local `.env` (do not overwrite the rest of that file):
+
+   ```dotenv
+   MONITOR_USERNAME=your-chosen-username
+   MONITOR_PASSWORD_HASH=scrypt-v1:...paste-the-generated-hash...
+   MONITOR_ORIGIN=https://your-app.example.com
+   MONITOR_TRUST_PROXY=true
+   ```
+
+   `MONITOR_ORIGIN` is the exact public origin, including a nonstandard port if
+   needed, with no path or trailing slash. HTTPS is required for remote access.
+   The current Node server serves HTTP; use your platform's HTTPS reverse proxy.
+   Set `MONITOR_TRUST_PROXY=true` **only** when that proxy overwrites
+   `X-Forwarded-Proto` and the backend cannot be reached directly from the public
+   internet. Keep it false for a direct TLS server.
+3. Restart the backend, visit `https://your-app.example.com/monitor`, and sign in.
+
+For local development, use `MONITOR_ORIGIN=http://localhost:8080` and
+`MONITOR_TRUST_PROXY=false`, and open that exact host/port. This HTTP exception
+accepts only loopback client connections. It does not enable HTTP access over LAN.
+
+### Access and retention
+
+- The page, application JavaScript, snapshot API and SSE live stream require a
+  valid session. Only the sign-in page and its static assets are public once
+  configuration is valid. Monitor files are outside the legacy public UI folder.
+- Sessions are random, stored server-side, and expire after eight hours. Cookies
+  are `HttpOnly`, `SameSite=Strict`, scoped to `/monitor`, and `Secure` for HTTPS.
+  Logout revokes the session and its live streams. Restarts invalidate all sessions.
+- Login accepts five attempts per socket IP and thirty globally per fifteen
+  minutes, including successful logins. Forwarded client IP headers are ignored;
+  users behind the same proxy may share the lower limit. Password verification
+  is serialized to bound its CPU/memory cost. No password is logged or returned.
+- The monitor checks the configured host and origin, rejects cross-origin writes,
+  disables caching and framing, and uses a restrictive content security policy.
+  Session controls follow the [OWASP session management guidance](https://cheatsheetseries.owasp.org/cheatsheets/Session_Management_Cheat_Sheet.html).
+- History is **in memory**: up to 200 ended calls for up to 24 hours, 100 events
+  per call, and 200 recent issues. Speech and translation text are limited to
+  400 segments or 64,000 characters per call; older segments are omitted when
+  that limit is reached. The page shows the latest 30 issues. History resets on
+  restart; it is not a durable audit log. Use one backend instance.
+- The monitor retains call IDs, languages, counters, timestamps, safe error
+  categories, recognized speech text and translated text. Speech text is fetched
+  only for the selected call through an authenticated endpoint; it is not sent
+  to every live viewer in the all-calls stream. Audio, raw provider errors and
+  credentials are not captured. Existing server console logging is unchanged.
+- Audio activity may be silence. Status does not prove translation quality or
+  audio delivery at the far endpoint. A lost live stream marks the page as stale.
+  Legacy translator errors are reported without adding automatic call termination.
+- Select a call and choose **Export .txt** to download its current status, direction
+  details, counters, event timeline, retained issues, recognized speech and
+  translations. The export excludes audio and cannot include history already lost
+  to a restart or retention limit. Treat downloaded files as sensitive call data.
+
+Monitor authentication protects `/monitor` and its subroutes. The existing
+`/media`, `/agent`, `/audiosocket`, TCP AudioSocket and legacy browser demo retain
+their existing access behavior; call-ingress authentication is a separate change.
 
 ## Legacy browser demo
 

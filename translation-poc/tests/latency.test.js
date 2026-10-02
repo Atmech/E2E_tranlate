@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import vm from 'node:vm';
 import { EventEmitter } from 'node:events';
+import { CallMonitor, failureCause } from '../bridge/CallMonitor.js';
 import { OutputPacer, buildAudioFrame, createParser } from '../bridge/audiosocket.js';
 import * as audio from '../bridge/audio.js';
 
@@ -203,6 +204,7 @@ for (const transport of ['tcp', 'ws']) test(`${transport}: browser rebinds acros
     http: { createServer: () => new Server() }, path: { join: (...s) => s.join('/') },
     WebSocketServer: class extends Server { constructor() { super(); wsServers.push(this); } },
     CallBridge: Bridge, createParser, FRAME: { UUID: 1, AUDIO: 16, HANGUP: 0 },
+    CallMonitor, createMonitorHandler: () => async () => false,
   });
   vm.runInContext(source + '\nthis.calls = activeCalls;', context);
   const agent = new EventEmitter(); agent.send = () => {}; wsServers[0].emit('connection', agent);
@@ -316,7 +318,7 @@ test('reattaching same browser preserves PTT; closing another browser cannot det
   class Translator { async start() {} beginInput() {} endInput() { this.ended = true; } close() {} }
   const { CallBridge } = loadModule('../bridge/CallBridge.js', {
     Translator, OutputPacer: class { start() {} stop() {} },
-    WebSocket: { OPEN: 1 }, ...audio,
+    WebSocket: { OPEN: 1 }, failureCause, ...audio,
   }, 'CallBridge');
   const bridge = new CallBridge('test', {});
   await bridge.init();

@@ -1,5 +1,6 @@
 // One call owns two Asterisk connections and one translator per speaker.
 import { Translator } from './Translator.js';
+import { failureCause } from './CallMonitor.js';
 import { bufToInt16, int16ToBuf, pcm8kTo16k, pcm24kTo8k } from './audio.js';
 
 export function readMediaMetadata(variables) {
@@ -19,7 +20,7 @@ const opposite = role => role === 'caller' ? 'agent' : 'caller';
 
 export class CallTranslationSession {
   constructor(callId, { onClose, createTranslator = (lang, options) => new Translator(lang, options),
-    setupTimeoutMs = 30000 } = {}) {
+    setupTimeoutMs = 30000, monitor } = {}) {
     this.callId = callId;
     this.legs = new Map();
     this.closed = false;
@@ -28,6 +29,11 @@ export class CallTranslationSession {
     this.onClose = onClose || (() => {});
     this.createTranslator = createTranslator;
     this.setupTimeoutMs = setupTimeoutMs;
+    this.monitor = monitor;
+    this.monitorId = monitor?.start(callId);
+    monitor?.watch(this.monitorId, () => Object.fromEntries([...this.legs].map(([role, leg]) => [role,
+      { queueMs: Math.round(leg.pacer.queuedMs || 0), maxQueueMs: Math.round(leg.pacer.stats?.maxQueueMs || 0),
+        droppedBytes: leg.droppedBytes }])));
     this._armTimeout('Waiting for second participant timed out');
   }
 
@@ -46,6 +52,9 @@ export class CallTranslationSession {
       throw new Error('Caller and agent languages must be reciprocal');
     pacer.label = `${callId} ${opposite(role)}->${role}`;
     this.legs.set(role, { sourceLang, targetLang, sock, pacer, droppedBytes: 0 });
+    this.monitor?.leg(this.monitorId, role, { sourceLang, targetLang, connected: true,
+      translator: 'waiting', receivedBytes: 0, sentBytes: 0, droppedBytes: 0, queueMs: 0 });
+    this.monitor?.event(this.monitorId, 'info', 'Participant connected', role);
     console.log(`[media ${callId}] joined role=${role} ${sourceLang}->${targetLang}`);
     // Defer startup until the handler has installed its connection cleanup adapter.
     if (this.legs.size === 2) {
@@ -54,19 +63,34 @@ export class CallTranslationSession {
     } else console.log(`[media ${callId}] waiting for ${opposite(role)}`);
     return {
       onCallAudio: pcm => this.onAudio(role, pcm),
-      close: () => this.close(`${role} disconnected`),
+      close: (reason, failed = false) => this.close(reason || `${role} disconnected`, failed ? 1011 : 1000),
+      onTransport: values => this.monitor?.leg(this.monitorId, role, values),
+      onPause: paused => {
+        this.monitor?.leg(this.monitorId, role, { paused });
+        this.monitor?.event(this.monitorId, paused ? 'warning' : 'info',
+          paused ? 'Playback paused by Asterisk' : 'Playback resumed', role);
+      },
     };
   }
 
   async _start() {
     if (this.closed) return;
+    this.monitor?.update(this.monitorId, { state: 'starting' });
+    this.monitor?.event(this.monitorId, 'info', 'Starting translators');
     try {
       for (const [role, leg] of this.legs) {
+        this.monitor?.leg(this.monitorId, role, { translator: 'starting' });
         const destination = this.legs.get(opposite(role));
         leg.translator = this.createTranslator(leg.targetLang, {
           sourceLang: leg.sourceLang,
-          onInputText: text => console.log(`[stt ${this.callId} ${role}] ${text}`),
-          onOutputText: text => console.log(`[translation ${this.callId} ${role}->${opposite(role)}] ${text}`),
+          onInputText: text => {
+            this.monitor?.transcript(this.monitorId, role, 'recognized', text);
+            console.log(`[stt ${this.callId} ${role}] ${text}`);
+          },
+          onOutputText: text => {
+            this.monitor?.transcript(this.monitorId, role, 'translated', text);
+            console.log(`[translation ${this.callId} ${role}->${opposite(role)}] ${text}`);
+          },
           onAudio: pcm24 => {
             if (this.closed) return;
             const pcm8 = int16ToBuf(pcm24kTo8k(pcm24));
@@ -74,16 +98,37 @@ export class CallTranslationSession {
             if (destination.pacer.queuedBytes + pcm8.length > 16000 * 30)
               return this.close('Playback queue exceeded thirty seconds', 1011);
             destination.pacer.push(pcm8);
+            this.monitor?.leg(this.monitorId, role, { lastOutputAt: Date.now() });
           },
           onTurnEnd: () => { if (!this.closed) destination.pacer.commit(); },
-          onFailure: () => this.close(`Translator failed for ${role}`, 1011),
+          onFailure: error => {
+            if (this.closed) return;
+            this.monitor?.leg(this.monitorId, role, { translator: 'failed' });
+            this.monitor?.event(this.monitorId, 'error', failureCause(error), role);
+            this.close(`Translator failed for ${role}`, 1011);
+          },
         });
       }
-      await Promise.all([...this.legs.values()].map(leg => leg.translator.start()));
+      await Promise.all([...this.legs.entries()].map(async ([role, leg]) => {
+        const started = Date.now();
+        try { await leg.translator.start(); }
+        catch (error) {
+          if (!this.closed) {
+            this.monitor?.leg(this.monitorId, role, { translator: 'failed' });
+            this.monitor?.event(this.monitorId, 'error', failureCause(error), role);
+          }
+          throw error;
+        }
+        if (!this.closed) this.monitor?.leg(this.monitorId, role, { translator: 'ready', setupMs: Date.now() - started });
+      }));
       if (this.closed) return;
       clearTimeout(this.timer);
       for (const leg of this.legs.values()) leg.pacer.start();
       this.ready = true;
+      for (const [role, leg] of this.legs) if (leg.droppedBytes)
+        this.monitor?.event(this.monitorId, 'warning', 'Audio received before translation was ready was dropped', role);
+      this.monitor?.update(this.monitorId, { state: 'ready' });
+      this.monitor?.event(this.monitorId, 'info', 'Translation ready in both directions');
       console.log(`[media ${this.callId}] translation ready: caller->agent and agent->caller`);
     } catch (error) {
       console.error(`[media ${this.callId}] translator setup failed:`, error.message);
@@ -94,7 +139,11 @@ export class CallTranslationSession {
   onAudio(role, pcm8) {
     if (this.closed) return;
     const leg = this.legs.get(role);
-    if (!this.ready) { leg.droppedBytes += pcm8.length; return; }
+    if (!this.ready) {
+      leg.droppedBytes += pcm8.length;
+      this.monitor?.leg(this.monitorId, role, { droppedBytes: leg.droppedBytes });
+      return;
+    }
     leg.translator.feed(pcm8kTo16k(bufToInt16(pcm8)));
   }
 
@@ -102,6 +151,7 @@ export class CallTranslationSession {
     if (this.closed) return;
     this.closed = true;
     this.ready = false;
+    this.monitor?.end(this.monitorId, reason, code !== 1000);
     clearTimeout(this.timer);
     this.onClose();
     for (const [role, leg] of this.legs) {

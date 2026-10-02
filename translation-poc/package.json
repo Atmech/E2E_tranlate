@@ -6,6 +6,8 @@
     "start": "node bridge/index.js",
     "dev": "node --watch bridge/index.js",
     "test": "node --test",
+    "monitor:password": "node scripts/monitor-password.js",
+    "test:monitor-http": "node --test scripts/check-monitor-http.js",
     "test:media-ws": "node --test scripts/check-media-websocket.js",
     "smoke": "node scripts/smoke-gemini.js",
     "smoke:asterisk-ws": "node scripts/smoke-asterisk-ws.js"
