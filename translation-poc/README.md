@@ -156,6 +156,12 @@ paired calls, the legacy browser flow, and loopback calls are included. Rejected
 connections appear in the issue feed even when no valid call ID was supplied.
 The monitor is read-only and does not create a browser-agent audio connection.
 
+Use the summary cards to filter ongoing, waiting, attention-needed, or failed
+calls. Search by call ID or language name; **Clear filters** restores all calls.
+Select a call to open **Conversation**, **Health**, and **Events** tabs. Conversation
+follows new speech while you are at the bottom; scroll up to read earlier text.
+The **Connection guide** explains how to start a paired call when the list is empty.
+
 **Access is disabled by default.** There is no default username or password.
 Leave the monitor settings blank until you are ready to configure access; all
 monitor routes return 503 in that state, while calls continue normally.

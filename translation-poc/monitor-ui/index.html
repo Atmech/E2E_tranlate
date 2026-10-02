@@ -1,24 +1,50 @@
 <!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Call Monitor</title><link rel="stylesheet" href="/monitor/style.css"><script src="/monitor/app.js" defer></script></head>
+<html lang="en">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Call Monitor</title>
+  <link rel="stylesheet" href="/monitor/style.css">
+  <script src="/monitor/app.js" defer></script>
+</head>
 <body><main class="shell">
-<header><div><div class="eyebrow">TRANSLATION OPERATIONS</div><h1>Call Monitor</h1><p class="muted">Live connections, translation health, and recent issues.</p></div>
-<div class="header-actions"><span id="connection" class="badge warning" role="status">Connecting…</span><button id="logout">Sign out</button></div></header>
-<div id="notice" class="notice" role="status">Connecting to the monitor…</div>
-<section class="summary" aria-label="Call summary">
-<article><span>Active calls</span><strong id="active">—</strong><small>Currently connected</small></article>
-<article><span>Starting / waiting</span><strong id="waiting">—</strong><small>Participants or translators</small></article>
-<article><span>Needs attention</span><strong id="attention">—</strong><small>Active calls with issues</small></article>
-<article><span>Recent failures</span><strong id="failed">—</strong><small>Within retained history</small></article>
-</section>
-<div class="workspace"><section class="panel calls-panel"><div class="panel-heading"><h2>Calls</h2><span id="count" class="muted"></span></div>
-<div class="filters"><input id="search" aria-label="Search call ID" placeholder="Search call ID…" type="search">
-<select id="scope" aria-label="Call scope"><option value="all">All calls</option><option value="active">Active calls</option><option value="ended">Ended calls</option></select>
-<label class="checkbox"><input id="issues-only" type="checkbox"> Issues only</label></div>
-<div class="table-scroll"><table><thead><tr><th>Call / languages</th><th>Status</th><th>Duration</th><th>Latest issue</th></tr></thead><tbody id="calls"></tbody></table></div>
-<p id="empty" class="empty">Waiting for the first update…</p></section>
-<aside class="panel detail" aria-label="Call details"><div class="panel-heading"><h2>Call details</h2><div class="detail-actions"><button id="export-call" hidden>Export .txt</button><button id="clear-selection" hidden>Close</button></div></div>
-<div id="detail"><p class="empty">Select a call to inspect both directions and its event timeline.</p></div></aside></div>
-<section class="panel issues-panel"><div class="panel-heading"><h2>Recent issues</h2><span class="muted">Includes rejected connections</span></div><div id="issue-feed"><p class="empty">Waiting for the first update…</p></div></section>
-<footer><span id="retention">Recent history is held in memory and resets on server restart.</span><span id="updated">No update yet</span></footer>
-</main></body></html>
+  <header>
+    <div><div class="eyebrow">TRANSLATION OPERATIONS</div><h1>Call monitor</h1><p class="muted">Follow the conversation. Spot what needs attention.</p></div>
+    <div class="header-actions"><span id="connection" class="badge warning" role="status">Connecting…</span><button id="show-guide" aria-expanded="false" aria-controls="setup-guide">Connection guide</button><button id="logout" class="quiet">Sign out</button></div>
+  </header>
+  <div id="notice" class="notice" role="status">Connecting to the monitor…</div>
+  <section id="setup-guide" class="panel setup-guide" hidden aria-labelledby="guide-title">
+    <div class="panel-heading"><h2 id="guide-title">Connect your first translated call</h2><button id="hide-guide" aria-label="Close connection guide">Close</button></div>
+    <ol class="setup-steps">
+      <li><strong>Place a call through Asterisk</strong><p>This monitor observes calls. Start the phone call from your SIP client using your configured two-participant dialplan.</p></li>
+      <li><strong>Connect both participants</strong><p>Send caller and agent channels to <code>/media</code> with the same <code>CALL_ID</code>, distinct <code>ROLE</code> values, and reciprocal <code>SOURCE_LANG</code> / <code>TARGET_LANG</code>.</p></li>
+      <li><strong>Wait for “Translating”</strong><p>The call appears here automatically. Open it to follow speech, translations, and the health of each direction.</p></li>
+    </ol>
+    <p class="guide-note">Not seeing a call? Check Asterisk routing and the bridge logs. The bundled 5000 extension is a transport test; paired translation needs the two-participant dialplan described in the project README.</p>
+  </section>
+  <section class="summary" aria-label="Filter calls by status">
+    <button data-filter="active" aria-pressed="false"><span class="metric-label">Active calls <span aria-hidden="true">↗</span></span><strong id="active">—</strong><small>All ongoing calls</small></button>
+    <button data-filter="waiting" aria-pressed="false"><span class="metric-label">Starting / waiting <span aria-hidden="true">↗</span></span><strong id="waiting">—</strong><small>Waiting for connection or translation</small></button>
+    <button data-filter="attention" aria-pressed="false"><span class="metric-label">Needs attention <span aria-hidden="true">↗</span></span><strong id="attention">—</strong><small>Ongoing calls with issues</small></button>
+    <button data-filter="failed" aria-pressed="false"><span class="metric-label">Failed calls <span aria-hidden="true">↗</span></span><strong id="failed">—</strong><small>In recent history</small></button>
+  </section>
+  <div id="workspace" class="workspace">
+    <section class="panel calls-panel">
+      <div class="panel-heading"><div class="heading-group"><h2>Calls</h2><span id="count" class="count muted">Loading…</span></div><span class="muted">Select a call to inspect →</span></div>
+      <div class="filters">
+        <input id="search" aria-label="Search call ID or language" placeholder="Search call ID or language…" type="search">
+        <select id="scope" aria-label="Call scope"><option value="all">All calls</option><option value="active">Active calls</option><option value="waiting">Starting / waiting</option><option value="attention">Needs attention</option><option value="failed">Failed calls</option><option value="ended">Ended calls</option></select>
+        <label class="checkbox"><input id="issues-only" type="checkbox"> With issues</label><button id="reset-filters" class="quiet" hidden>Clear filters</button>
+      </div>
+      <div id="call-table" class="table-scroll" hidden><table><thead><tr><th>Call / languages</th><th>Status</th><th>Duration</th><th>Latest issue</th></tr></thead><tbody id="calls"></tbody></table></div>
+      <div id="empty" class="empty call-empty"><div class="empty-symbol" aria-hidden="true">↔</div><h3 id="empty-title">Connecting to your call feed</h3><p id="empty-message">Calls will appear here when the monitor connects.</p><button id="empty-action" class="primary" hidden>How to connect a call</button><small id="empty-hint">This page monitors calls started through Asterisk.</small></div>
+    </section>
+    <aside id="detail-panel" class="panel detail" aria-label="Call details" hidden>
+      <div class="panel-heading"><h2 id="detail-heading" tabindex="-1">Call details</h2><div class="detail-actions"><button id="export-call" hidden>Export .txt</button><button id="clear-selection" aria-label="Close call details" hidden>Close</button></div></div>
+      <div class="detail-tabs" role="tablist" aria-label="Call information"><button id="tab-conversation" role="tab" aria-selected="true" aria-controls="detail" data-tab="conversation">Conversation</button><button id="tab-health" role="tab" aria-selected="false" aria-controls="detail" tabindex="-1" data-tab="health">Health</button><button id="tab-events" role="tab" aria-selected="false" aria-controls="detail" tabindex="-1" data-tab="events">Events</button></div>
+      <div id="detail" role="tabpanel" aria-labelledby="tab-conversation" tabindex="0"></div>
+    </aside>
+  </div>
+  <section class="panel issues-panel"><div class="panel-heading"><div class="heading-group"><h2>Recent issues</h2><span id="issue-count" class="count muted">—</span></div><span class="muted">Including rejected connections</span></div><div id="issue-feed"><p class="empty">Waiting for the first update…</p></div></section>
+  <footer><span id="retention">History resets on server restart.</span><span id="updated">No update yet</span></footer>
+</main></body>
+</html>
