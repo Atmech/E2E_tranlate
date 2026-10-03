@@ -6,7 +6,7 @@ import { handleNativeConnection } from '../bridge/native-websocket.js';
 const start = { event: 'MEDIA_START', connection_id: 'test-call', format: 'slin', optimal_frame_size: 320, ptime: 20 };
 const settle = () => new Promise(resolve => setImmediate(resolve));
 
-function connect(t, { activeCalls = new Map(), agents = new Set(), init, mode = 'mock' } = {}) {
+function connect(t, { activeCalls = new Map(), agents = new Set(), init, mode = 'mock', createTranslator } = {}) {
   const ws = new EventEmitter();
   ws.readyState = 1; ws.bufferedAmount = 0; ws.sent = [];
   ws.send = (data, options) => ws.sent.push({ data, options });
@@ -14,7 +14,7 @@ function connect(t, { activeCalls = new Map(), agents = new Set(), init, mode = 
     ws.closeCode = code; ws.closeReason = reason; ws.readyState = 3; ws.emit('close');
   };
   let call;
-  handleNativeConnection(ws, { activeCalls, agents, mode, createBridge: (id, sock, { pacer }) => {
+  handleNativeConnection(ws, { activeCalls, agents, mode, createTranslator, createBridge: (id, sock, { pacer }) => {
     call = {
       id, sock, pacer, audio: [], attached: [], closed: false,
       init: init || (async () => {}),
@@ -134,4 +134,75 @@ test('loopback preserves setup validation, single-call exclusion, and slow-netwo
   assert.equal(concurrent.ws.closeCode, 1008); assert.equal(c.activeCalls.size, 1);
   c.ws.bufferedAmount = 80001; c.audio(Buffer.alloc(320));
   assert.equal(c.ws.closeCode, 1008); assert.equal(c.activeCalls.size, 0);
+});
+
+test('brief XOFF/XON between callbacks suppresses catch-up on resume', t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const c = connect(t); c.control(start);
+  let now = 0;
+  const pacer = c.call.pacer;
+  pacer.now = () => now;
+  pacer.push(Buffer.alloc(6400, 7)); pacer.start();
+  now = 20; t.mock.timers.tick(20);
+  assert.equal(c.ws.sent.length, 1);
+  now = 30; c.control('MEDIA_XOFF');
+  now = 35; c.control({ event: 'MEDIA_XON' });
+  now = 120; t.mock.timers.tick(20); // Timer for 40ms is 80ms late.
+  assert.equal(c.ws.sent.length, 2, 'resume sends only one frame');
+  assert.equal(pacer.nextTickAt, 140);
+  assert.equal(pacer.stats.recoveredFrames, 0);
+  assert.equal(pacer.stats.schedulerResyncs, 1);
+  now = 140; t.mock.timers.tick(20);
+  assert.equal(c.ws.sent.length, 3);
+  now = 240; t.mock.timers.tick(20);
+  assert.equal(c.ws.sent.length, 8, 'later scheduler stalls can recover normally');
+  c.ws.close(1000);
+  now = 400; t.mock.timers.tick(100);
+  assert.equal(c.ws.sent.length, 8);
+});
+
+test('paired translation XOFF/XON resets only the affected direction', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const activeCalls = new Map();
+  const createTranslator = () => ({ async start() {}, close() {}, feed() {} });
+  const caller = connect(t, { activeCalls, mode: 'translation', createTranslator });
+  const agent = connect(t, { activeCalls, mode: 'translation', createTranslator });
+  const metadata = { CALL_ID: 'clock-pair', ROLE: 'caller', SOURCE_LANG: 'hi', TARGET_LANG: 'en' };
+  caller.control({ ...start, channel_variables: metadata });
+  agent.control({ ...start, channel_variables: { ...metadata, ROLE: 'agent', SOURCE_LANG: 'en', TARGET_LANG: 'hi' } });
+  let now = 0;
+  const session = activeCalls.get('clock-pair');
+  for (const leg of session.legs.values()) leg.pacer.now = () => now;
+  await settle();
+  assert.equal(session.ready, true);
+  for (const leg of session.legs.values()) leg.pacer.push(Buffer.alloc(6400, 8));
+  now = 20; t.mock.timers.tick(20);
+  caller.control('MEDIA_XOFF'); caller.control('MEDIA_XON');
+  now = 120; t.mock.timers.tick(20);
+  assert.equal(caller.ws.sent.length, 2);
+  assert.equal(agent.ws.sent.length, 6);
+  assert.equal(session.legs.get('caller').pacer.stats.recoveredFrames, 0);
+  assert.equal(session.legs.get('agent').pacer.stats.recoveredFrames, 4);
+  caller.ws.close(1000);
+  assert.equal(activeCalls.size, 0);
+  now = 500; t.mock.timers.tick(100);
+  assert.equal(agent.ws.sent.length, 6, 'hangup cancels both clocks');
+});
+
+test('send-buffer failure during catch-up closes playback before further writes', t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const c = connect(t); c.control(start);
+  let now = 0;
+  c.call.pacer.now = () => now;
+  c.ws.send = (data, options) => {
+    c.ws.sent.push({ data, options }); c.ws.bufferedAmount = 80001;
+  };
+  c.call.pacer.push(Buffer.alloc(6400)); c.call.pacer.start();
+  now = 100; t.mock.timers.tick(20);
+  assert.equal(c.ws.sent.length, 1);
+  assert.equal(c.ws.closeCode, 1008);
+  assert.equal(c.call.pacer.running, false);
+  assert.equal(c.activeCalls.size, 0);
+  now = 300; t.mock.timers.tick(100);
+  assert.equal(c.ws.sent.length, 1);
 });

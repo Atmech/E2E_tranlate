@@ -46,7 +46,7 @@ test('split input preserves samples and accounts for partial-frame bytes', () =>
   assert.deepEqual(Buffer.concat(sent).subarray(0, input.length), input);
   assert.ok(Buffer.concat(sent).subarray(input.length).every(b => b === 0));
 });
-test('blocked playback and late ticks are measured without dropping or burst catch-up', () => {
+test('individual ticks measure blocked playback and lateness without dropping audio', () => {
   const { pacer, sent, sock, tick } = setup();
   pacer.push(Buffer.alloc(3200));
   tick(20);
@@ -66,4 +66,9 @@ test('invalid backlog options fail before playback starts', () => {
     { maxBacklogMs: 1000 }, { trimBacklog: 'false' }, { logIntervalMs: -1 }]) {
     assert.throws(() => setup(options));
   }
+});
+
+test('invalid catch-up limits fail before playback starts', () => {
+  for (const maxCatchUpFrames of [-1, 11, 1.5, NaN, Infinity, '4', null])
+    assert.throws(() => setup({ maxCatchUpFrames }), /maxCatchUpFrames/);
 });

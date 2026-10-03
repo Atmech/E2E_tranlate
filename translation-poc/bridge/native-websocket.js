@@ -8,7 +8,7 @@ if (!['translation', 'loopback'].includes(MODE)) throw new Error('MEDIA_MODE mus
 
 export function handleNativeConnection(ws, { activeCalls, agents = new Set(), createBridge,
   mode = MODE, createTranslator, setupTimeoutMs, monitor }) {
-  let bridge, callId, paused = false, ended = false;
+  let bridge, callId, pacer, paused = false, ended = false;
   const stats = { receivedBytes: 0, sentBytes: 0 };
   const sock = {
     get destroyed() { return ended || ws.readyState !== 1; },
@@ -90,7 +90,7 @@ export function handleNativeConnection(ws, { activeCalls, agents = new Set(), cr
             activeCalls.set(metadata.callId, session);
             console.log(`[media ${metadata.callId}] new translation session activeCalls=${activeCalls.size}`);
           }
-          const pacer = new OutputPacer(sock, { encodeFrame: pcm => pcm, sendSilence: false });
+          pacer = new OutputPacer(sock, { encodeFrame: pcm => pcm, sendSilence: false });
           try { bridge = session.addLeg(metadata, sock, pacer); }
           catch (error) { return fail(error.message); }
           callId = metadata.callId;
@@ -125,7 +125,7 @@ export function handleNativeConnection(ws, { activeCalls, agents = new Set(), cr
             },
           };
         } else {
-          const pacer = new OutputPacer(sock, { encodeFrame: pcm => pcm, sendSilence: false });
+          pacer = new OutputPacer(sock, { encodeFrame: pcm => pcm, sendSilence: false });
           // Injected audio source used by the transport-only smoke test.
           bridge = createBridge(callId, sock, { pacer });
         }
@@ -135,9 +135,11 @@ export function handleNativeConnection(ws, { activeCalls, agents = new Set(), cr
         if (ended) return;
         for (const agent of agents) bridge.attachAgent(agent);
       } else if (event.event === 'MEDIA_XOFF') {
+        if (!paused) pacer?.resetClock();
         paused = true;
         bridge?.onPause?.(true);
       } else if (event.event === 'MEDIA_XON') {
+        if (paused) pacer?.resetClock();
         paused = false;
         bridge?.onPause?.(false);
       } else if (event.event === 'DTMF_END') {
