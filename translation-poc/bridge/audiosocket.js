@@ -61,7 +61,8 @@ export class OutputPacer {
     maxWaitMs = MAX_WAIT_MS, endGapMs = END_GAP_MS,
     encodeFrame = buildAudioFrame, sendSilence = true,
     warnBacklogMs = 3000, maxBacklogMs = 6000, targetBacklogMs = 3000,
-    trimBacklog = false, label = 'unlabelled', logIntervalMs = 5000 } = {}) {
+    trimBacklog = false, label = 'unlabelled', logIntervalMs = 5000,
+    maxCatchUpFrames = 4 } = {}) {
     for (const [name, value] of Object.entries({ warnBacklogMs, maxBacklogMs, targetBacklogMs })) {
       if (!Number.isFinite(value) || value < 20 || value > 30000)
         throw new Error(`${name} must be between 20 and 30000 milliseconds`);
@@ -71,8 +72,10 @@ export class OutputPacer {
     if (typeof trimBacklog !== 'boolean') throw new Error('trimBacklog must be boolean');
     if (!Number.isFinite(logIntervalMs) || logIntervalMs < 0)
       throw new Error('logIntervalMs must be nonnegative; zero disables periodic logging');
+    if (!Number.isInteger(maxCatchUpFrames) || maxCatchUpFrames < 0 || maxCatchUpFrames > 10)
+      throw new Error('maxCatchUpFrames must be an integer between 0 and 10');
     Object.assign(this, { sock, now, maxWaitMs, endGapMs, encodeFrame, sendSilence,
-      trimBacklog, label, logIntervalMs });
+      trimBacklog, label, logIntervalMs, maxCatchUpFrames });
     this.prebufferBytes = Math.ceil(prebufferMs / 20) * BYTES_PER_FRAME;
     this.warnBacklogBytes = Math.ceil(warnBacklogMs / 20) * BYTES_PER_FRAME;
     this.maxBacklogBytes = Math.ceil(maxBacklogMs / 20) * BYTES_PER_FRAME;
@@ -84,10 +87,12 @@ export class OutputPacer {
     this.lastTickAt = null;
     this.lastLogAt = null;
     this.wasBlocked = false;
+    this.clockResetPending = false;
     this.stats = { audioFrames: 0, silenceFrames: 0, maxQueueMs: 0, maxStartWaitMs: 0,
       inputAudioMs: 0, submittedAudioMs: 0, maxInputChunkMs: 0,
       backlogWarnings: 0, backlogTrims: 0, droppedFrames: 0, droppedMs: 0,
-      maxTickGapMs: 0, delayedTicks: 0, observedBlockedMs: 0 };
+      maxTickGapMs: 0, delayedTicks: 0, observedBlockedMs: 0,
+      recoveredFrames: 0, schedulerResyncs: 0, maxSchedulerLatenessMs: 0 };
     this.flush();
   }
 
@@ -106,8 +111,15 @@ export class OutputPacer {
     this.lastTickAt = this.startedAt;
     this.lastLogAt = this.startedAt;
     this.wasBlocked = this.sock?.writable === false;
+    this.clockResetPending = false;
     this.nextTickAt = this.startedAt + 20;
     this._scheduleNextTick();
+  }
+
+  // Flow-control events can occur entirely between timer callbacks. Discard
+  // scheduling debt on the next callback, while preserving the audio queue.
+  resetClock() {
+    if (this.running) this.clockResetPending = true;
   }
 
   _scheduleNextTick() {
@@ -118,11 +130,32 @@ export class OutputPacer {
       if (!this.running) return;
       const scheduledAt = this.nextTickAt;
       const lateness = Math.max(0, this.now() - scheduledAt);
-      this._tick(); // At most one frame per callback, including after a stall.
+      this.stats.maxSchedulerLatenessMs = Math.max(this.stats.maxSchedulerLatenessMs, lateness);
+      const ticksDue = 1 + Math.floor(lateness / 20);
+      const resetClock = this.clockResetPending || (this.wasBlocked && this.sock?.writable !== false);
+      this.clockResetPending = false;
+      const firstResult = this._tick();
       if (!this.running) return;
-      // Correct small delays against the original clock. After missing a whole
-      // period, re-anchor instead of rapidly submitting all the missed frames.
-      this.nextTickAt = lateness < 20 ? scheduledAt + 20 : this.now() + 20;
+      let recovered = 0;
+      if (!resetClock && firstResult === 'audio') {
+        const limit = Math.min(ticksDue - 1, this.maxCatchUpFrames);
+        while (recovered < limit && this.running && !this.clockResetPending &&
+            !this.sock?.destroyed && this.sock?.writable !== false) {
+          if (this._tick({ audioOnly: true }) !== 'audio') break;
+          recovered++;
+          this.stats.recoveredFrames++;
+        }
+      }
+      if (!this.running) return;
+      const nextDeadline = scheduledAt + ticksDue * 20;
+      // Retain the monotonic clock only when all due frames were serviced.
+      // Resync after flow control, insufficient audio, or a large stall. Slow
+      // writes also re-anchor, avoiding consecutive zero-delay catch-up bursts.
+      const now = this.now();
+      if (resetClock || this.clockResetPending || 1 + recovered < ticksDue || nextDeadline <= now) {
+        this.stats.schedulerResyncs++;
+        this.nextTickAt = now + 20;
+      } else this.nextTickAt = nextDeadline;
       this._scheduleNextTick();
     }, delay);
   }
@@ -206,7 +239,7 @@ export class OutputPacer {
     console.log(`[pacer ${this.label}] ${event}`, { ...this.stats,
       queuedMs: this.queuedMs, elapsedMs: this.startedAt === null ? null : now - this.startedAt });
   }
-  _tick() {
+  _tick({ audioOnly = false } = {}) {
     const now = this.now();
     if (this.lastTickAt !== null) {
       const gap = Math.max(0, now - this.lastTickAt);
@@ -221,18 +254,22 @@ export class OutputPacer {
       this._report(now, 'playback sample');
       this.lastLogAt = now;
     }
-    if (this.wasBlocked || this.sock?.destroyed) return;
+    if (this.sock?.destroyed) return 'closed';
+    if (this.wasBlocked) return 'blocked';
+    const tailReady = this.committed || now - this.lastPushAt >= this.maxWaitMs;
+    // Recovery must never emit silence or consume a tail before commit/timeout.
+    if (audioOnly && (!this.draining || (!this.queuedFrames && !(this.partial.length && tailReady))))
+      return 'silence';
     if (!this.draining) {
-      if (!this.queuedBytes) { this._writeSilence(); return; }
+      if (!this.queuedBytes) { this._writeSilence(); return 'silence'; }
       const waited = now - this.queuedAt;
       if (!this.committed && this.queuedBytes < this.prebufferBytes && waited < this.maxWaitMs) {
-        this._writeSilence(); return;
+        this._writeSilence(); return 'silence';
       }
       this.stats.maxStartWaitMs = Math.max(this.stats.maxStartWaitMs, waited);
       this.draining = true;
       this.silenceRun = 0;
     }
-    const tailReady = this.committed || now - this.lastPushAt >= this.maxWaitMs;
     let frame;
     if (this.queuedFrames) {
       frame = this.frames[this.head++];
@@ -249,10 +286,12 @@ export class OutputPacer {
       this.stats.audioFrames++;
       this.stats.submittedAudioMs += 20;
       this._write(frame);
+      return 'audio';
     } else {
       this.silenceRun += 20;
       if (this.silenceRun > this.endGapMs) this.draining = false;
       this._writeSilence();
+      return 'silence';
     }
   }
   stop() {

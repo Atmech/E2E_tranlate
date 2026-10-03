@@ -244,6 +244,37 @@ starting `docker compose up -d` in `asterisk/`.
 
 Protocol reference: [Asterisk native media WebSocket](https://docs.asterisk.org/Configuration/Channel-Drivers/WebSocket/).
 
+## Output playback clock
+
+Native paired calls and legacy AudioSocket playback share `OutputPacer`. Normal
+playback submits one 20ms frame per callback. A late callback can recover up to
+four extra queued audio frames (five frames / 100ms total). If the stall exceeds
+that limit, audio runs out, or writes overrun the next deadline, the scheduler
+re-anchors to the current time plus 20ms. Recovery preserves sample order and
+does not discard speech. It does not recover an arbitrarily large backlog.
+
+Catch-up never adds silence or pads an incomplete tail before its normal
+commit/timeout. `MEDIA_XOFF` / `MEDIA_XON` transitions suppress catch-up on the
+next callback, even if both events occur between ticks. A sampled blocked socket
+also resumes with a single frame. Queued speech remains available after a pause.
+The constructor option `maxCatchUpFrames` defaults to 4; 0 disables recovery.
+No environment-variable changes are required.
+
+Periodic playback samples and hangup statistics include:
+
+- `recoveredFrames`: extra audio frames submitted during scheduler catch-up.
+- `schedulerResyncs`: clock re-anchors, including flow control and occasions when
+  the available audio or catch-up limit cannot service every missed deadline.
+- `maxSchedulerLatenessMs`: largest callback delay relative to its scheduled time.
+
+Before increasing concurrency, repeat the five-call / five-minute phone test and
+compare each direction's `queuedMs`, `inputAudioMs`, `submittedAudioMs`,
+`delayedTicks`, `observedBlockedMs`, and the new counters. Check that speech stays
+intact and scheduling-related backlog does not keep climbing. Measure heard
+delay at the receiving endpoint too: pacer submission is not proof of playback
+or end-to-end translation latency. The offline clock regression simulates ten
+directions with shared stalls; it does not measure Asterisk or Gemini capacity.
+
 ## Legacy browser demo latency tuning
 
 These browser/PTT settings apply to the legacy AudioSocket demo. Open the agent
