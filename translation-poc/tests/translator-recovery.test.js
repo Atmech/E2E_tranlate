@@ -1,0 +1,221 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import vm from 'node:vm';
+import { int16ToB64 } from '../bridge/audio.js';
+
+const settle = async () => { for (let i = 0; i < 30; i++) await Promise.resolve(); };
+function harness(env = {}) {
+  let time = 0, id = 0;
+  const timers = new Map(), calls = [], failures = [];
+  const timer = (fn, ms, repeat = false) => {
+    timers.set(++id, { fn, ms, at: time + ms, repeat }); return id;
+  };
+  const context = vm.createContext({
+    console: { log() {}, warn() {}, error() {} }, Buffer, Int16Array, performance,
+    process: { env }, int16ToB64, Modality: { AUDIO: 'AUDIO' },
+    setTimeout: (fn, ms) => timer(fn, ms), clearTimeout: id => timers.delete(id),
+    setInterval: (fn, ms) => timer(fn, ms, true), clearInterval: id => timers.delete(id),
+    GoogleGenAI: class { live = { connect: options => new Promise((resolve, reject) => {
+      const call = { ...options, sent: [], closed: 0, reject, throwSend: false };
+      call.session = {
+        sendRealtimeInput(payload) {
+          if (call.throwSend) throw new Error('send failed');
+          call.sent.push({ payload, at: time });
+        },
+        close() { call.closed++; call.callbacks.onclose({ reason: 'intentional close' }); },
+      };
+      call.open = () => resolve(call.session);
+      call.ready = () => call.callbacks.onmessage({ setupComplete: {} });
+      call.message = message => call.callbacks.onmessage(message);
+      call.close = () => call.callbacks.onclose({ reason: 'remote close' });
+      calls.push(call);
+    }) }; },
+  });
+  const source = fs.readFileSync(new URL('../bridge/Translator.js', import.meta.url), 'utf8')
+    .replace(/^import .*;\n/gm, '').replace('export class Translator', 'class Translator');
+  vm.runInContext(source + '\nthis.Translator = Translator;', context);
+  const t = new context.Translator('en', { onFailure: error => failures.push(error) });
+  const tick = async ms => {
+    const end = time + ms;
+    while (true) {
+      const next = [...timers].filter(([, item]) => item.at <= end).sort((a, b) => a[1].at - b[1].at)[0];
+      if (!next) break;
+      const [key, item] = next; time = item.at;
+      if (item.repeat) item.at += item.ms; else timers.delete(key);
+      item.fn(); await settle();
+    }
+    time = end;
+  };
+  return { t, calls, failures, timers, tick,
+    async start() { const p = t.start(); calls[0].open(); calls[0].ready(); await p; },
+    async ready(index = calls.length - 1) { calls[index].open(); calls[index].ready(); await settle(); },
+    async rotate(handle = 'handle') {
+      calls.at(-1).message({ sessionResumptionUpdate: { resumable: true, newHandle: handle } });
+      calls.at(-1).message({ goAway: { timeLeft: '60s' } }); await settle();
+    },
+  };
+}
+const pcm = value => new Int16Array(320).fill(value);
+const samples = call => call.sent.filter(x => x.payload.audio).map(x => Buffer.from(x.payload.audio.data, 'base64').readInt16LE());
+
+test('setup acceptance gates audio; configuration retains translation and enables long sessions', async () => {
+  const h = harness(); const starting = h.t.start();
+  h.calls[0].open(); await settle(); h.t.feed(pcm(1));
+  assert.equal(h.t.session, null); assert.equal(h.calls[0].sent.length, 0);
+  assert.ok(h.calls[0].config.contextWindowCompression.slidingWindow);
+  assert.ok(h.calls[0].config.sessionResumption);
+  assert.equal(h.calls[0].config.translationConfig.targetLanguageCode, 'en');
+  h.calls[0].ready(); await starting;
+  assert.deepEqual(samples(h.calls[0]), [1]); h.t.close();
+});
+
+test('GoAway resumes latest handle; stale callbacks cannot kill call or emit audio', async () => {
+  const h = harness(); await h.start(); let audio = 0; h.t.onAudio = () => audio++;
+  h.calls[0].message({ sessionResumptionUpdate: { resumable: true, newHandle: 'older' } });
+  await h.rotate('latest');
+  assert.equal(h.calls[0].closed, 1);
+  assert.equal(h.calls[1].config.sessionResumption.handle, 'latest');
+  h.calls[0].close(); h.calls[0].callbacks.onerror(new Error('stale'));
+  h.calls[0].message({ serverContent: { modelTurn: { parts: [{ inlineData: { data: 'AAA=' } }] } } });
+  await h.ready(); assert.equal(audio, 0); assert.equal(h.failures.length, 0);
+  assert.equal(h.calls.length, 2); h.t.close(); assert.equal(h.timers.size, 0);
+});
+
+test('buffered speech preserves order and drains at real-time pace ahead of new audio', async () => {
+  const h = harness(); await h.start(); await h.rotate();
+  h.t.feed(pcm(1)); h.t.feed(pcm(2)); h.t.feed(pcm(3));
+  await h.ready(); h.t.feed(pcm(4));
+  assert.deepEqual(samples(h.calls[1]), [1]);
+  await h.tick(19); assert.deepEqual(samples(h.calls[1]), [1]);
+  await h.tick(41); assert.deepEqual(samples(h.calls[1]), [1, 2, 3, 4]);
+  assert.deepEqual(h.calls[1].sent.map(x => x.at), [0, 20, 40, 60]); h.t.close();
+});
+
+test('synthetic tail pauses through reconnect and backlog, then runs in real time', async () => {
+  const h = harness(); await h.start(); await h.rotate();
+  h.t.feed(pcm(9)); h.t.endInput(); await h.tick(500);
+  assert.equal(h.t.outbox.length, 1);
+  await h.ready(); assert.deepEqual(samples(h.calls[1]), [9]);
+  await h.tick(2000);
+  assert.equal(h.calls[1].sent.length, 22);
+  assert.equal(h.calls[1].sent.at(-1).payload.audioStreamEnd, true);
+  assert.ok(h.calls[1].sent[1].at >= 600); h.t.close();
+});
+
+test('new speech cancels paused synthetic tail', async () => {
+  const h = harness(); await h.start(); await h.rotate();
+  h.t.feed(pcm(1)); h.t.endInput(); await h.tick(200);
+  h.t.feed(pcm(2)); await h.ready(); await h.tick(2200);
+  assert.deepEqual(samples(h.calls[1]), [1, 2]); h.t.close();
+});
+
+test('close before setup completion rejects attempt, closes it, and retries', async () => {
+  const h = harness(); await h.start(); await h.rotate();
+  h.calls[1].open(); await settle(); h.calls[1].close(); await settle();
+  assert.equal(h.calls[1].closed, 1); assert.equal(h.t.session, null);
+  assert.equal(h.calls.length, 3); await h.ready(); assert.equal(h.failures.length, 0); h.t.close();
+});
+
+test('GoAway during setup rejects the attempt instead of hanging recovery', async () => {
+  const h = harness(); await h.start(); await h.rotate();
+  h.calls[1].open(); h.calls[1].message({ goAway: { timeLeft: '0s' } }); await settle();
+  assert.equal(h.calls.length, 3); await h.ready(); h.t.close();
+});
+
+test('three failed resume attempts lead to one fresh fallback with context reset', async () => {
+  const h = harness(); await h.start(); await h.rotate();
+  for (let i = 1; i <= 3; i++) { h.calls[i].reject(new Error('invalid handle')); await settle(); }
+  assert.equal(h.calls.length, 5); assert.equal(h.calls[4].config.sessionResumption.handle, undefined);
+  await h.ready(); assert.equal(h.failures.length, 0); assert.equal(h.t.resumeHandle, null); h.t.close();
+});
+
+test('failed fallback raises one terminal failure and releases timers and queue', async () => {
+  const h = harness(); await h.start(); await h.rotate(); h.t.feed(pcm(2));
+  for (let i = 1; i <= 4; i++) { h.calls[i].reject(new Error('unavailable')); await settle(); }
+  assert.equal(h.failures.length, 1); assert.equal(h.t.closed, true);
+  assert.equal(h.timers.size, 0); assert.equal(h.t.outbox.length, 0);
+  h.calls[0].close(); assert.equal(h.failures.length, 1);
+});
+
+test('missing handle rotates immediately to fresh session', async () => {
+  const h = harness(); await h.start(); h.calls[0].message({ goAway: { timeLeft: '0s' } }); await settle();
+  assert.equal(h.calls.length, 2); assert.equal(h.calls[1].config.sessionResumption.handle, undefined);
+  await h.ready(); h.t.close();
+});
+
+test('stalled setup times out; late session is disposed without activation', async () => {
+  const h = harness(); await h.start(); await h.rotate(); await h.tick(5000);
+  assert.equal(h.calls.length, 3); h.calls[1].open(); h.calls[1].ready(); await settle();
+  assert.equal(h.calls[1].closed, 1); assert.equal(h.t.session, null);
+  await h.ready(); h.t.close();
+});
+
+test('hangup while connecting cancels recovery and closes a late session', async () => {
+  const h = harness(); await h.start(); await h.rotate(); h.t.close(); await settle();
+  h.calls[1].open(); h.calls[1].ready(); await settle();
+  assert.equal(h.calls[1].closed, 1); assert.equal(h.calls.length, 2);
+  assert.equal(h.timers.size, 0); assert.equal(h.failures.length, 0);
+});
+
+test('buffer overflow fails once instead of silently dropping speech', async () => {
+  const h = harness(); await h.start(); await h.rotate();
+  for (let i = 0; i < 501; i++) h.t.feed(pcm(i));
+  await settle(); assert.equal(h.failures.length, 1); assert.match(h.failures[0].message, /buffer/);
+  assert.equal(h.t.outboxBytes, 0); assert.equal(h.timers.size, 0);
+});
+
+test('send and backlog flush failures close failed sockets and retain unsent input', async () => {
+  const h = harness(); await h.start();
+  h.calls[0].message({ sessionResumptionUpdate: { resumable: true, newHandle: 'h' } });
+  h.calls[0].throwSend = true; h.t.feed(pcm(7)); await settle();
+  assert.equal(h.calls[0].closed, 1);
+  h.calls[1].throwSend = true; await h.ready();
+  assert.equal(h.calls[1].closed, 1); assert.equal(h.calls.length, 3);
+  await h.ready(); assert.deepEqual(samples(h.calls[2]), [7]); h.t.close();
+});
+
+test('general-model stream-end remains ordered after buffered speech', async () => {
+  const h = harness({ GEMINI_LIVE_MODEL: 'general-live' }); await h.start(); await h.rotate();
+  h.t.feed(pcm(1)); h.t.endInput(); h.t.feed(pcm(2));
+  await h.ready(); await h.tick(50);
+  assert.deepEqual(h.calls[1].sent.map(x => x.payload.audioStreamEnd || 'audio'), ['audio', true, 'audio']); h.t.close();
+});
+
+test('five calls with two directions survive four independent rotations without terminal failure', async () => {
+  const directions = Array.from({ length: 10 }, () => harness());
+  for (const h of directions) await h.start();
+  for (let rotation = 0; rotation < 4; rotation++) {
+    for (let i = 0; i < directions.length; i++) {
+      const h = directions[i]; await h.rotate(`direction-${i}-rotation-${rotation}`);
+      h.t.feed(pcm(i + 1)); await h.ready(); await h.tick(20);
+      assert.equal(h.calls.at(-1).config.sessionResumption.handle, `direction-${i}-rotation-${rotation}`);
+      assert.deepEqual(samples(h.calls.at(-1)), [i + 1]);
+    }
+  }
+  for (const h of directions) { assert.equal(h.failures.length, 0); h.t.close(); assert.equal(h.timers.size, 0); }
+});
+
+test('repeated setup success followed by send failure exhausts the bounded recovery budget', async () => {
+  const h = harness(); await h.start(); await h.rotate(); h.t.feed(pcm(1));
+  for (let i = 1; i <= 4; i++) {
+    h.calls[i].throwSend = true; await h.ready(i); assert.equal(h.calls[i].closed, 1);
+  }
+  assert.equal(h.calls.length, 5); assert.equal(h.failures.length, 1);
+  assert.equal(h.timers.size, 0); assert.equal(h.t.outbox.length, 0);
+});
+
+test('initial setup rejection fails once and never activates the closed socket', async () => {
+  const h = harness(); const starting = h.t.start();
+  h.calls[0].open(); await settle(); h.calls[0].close();
+  await assert.rejects(starting, /remote close/);
+  assert.equal(h.t.session, null); assert.equal(h.failures.length, 1);
+  assert.equal(h.calls[0].closed, 1); assert.equal(h.timers.size, 0);
+});
+
+test('synthetic tail retries failed silence after recovery rather than dropping the tail', async () => {
+  const h = harness(); await h.start(); h.t.feed(pcm(1)); h.t.endInput();
+  h.calls[0].throwSend = true; await h.tick(100); await h.ready(); await h.tick(2000);
+  assert.equal(h.calls[1].sent.length, 21); assert.equal(h.calls[1].sent.at(-1).payload.audioStreamEnd, true);
+  h.t.close();
+});
