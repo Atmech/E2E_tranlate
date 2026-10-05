@@ -87,8 +87,12 @@ function loadModule(file, bindings, exports) {
 
 function translator(connect, bindings = {}) {
   const { Translator } = loadModule('../bridge/Translator.js', {
-    GoogleGenAI: class { live = { connect }; }, Modality: { AUDIO: 'AUDIO' },
-    int16ToB64: audio.int16ToB64, ...bindings,
+    GoogleGenAI: class { live = { connect: async options => {
+      const session = await connect(options);
+      options.callbacks.onmessage({ setupComplete: {} });
+      return session;
+    } }; }, Modality: { AUDIO: 'AUDIO' },
+    int16ToB64: audio.int16ToB64, setTimeout, clearTimeout, ...bindings,
   }, 'Translator');
   return new Translator('ar');
 }
@@ -372,7 +376,7 @@ test('browser separates bridge connection from mic readiness and disables PTT af
   assert.equal(b.run('talking'), false);
 });
 
-test('translator reports unexpected closure and errors, but not intentional shutdown', async () => {
+test('translator recovers unexpected closure and ignores stale callbacks after shutdown', async () => {
   let callbacks;
   const t = translator(async options => {
     callbacks = options.callbacks;
@@ -383,11 +387,13 @@ test('translator reports unexpected closure and errors, but not intentional shut
   await t.start();
   callbacks.onerror(new Error('transport failed'));
   callbacks.onclose({ reason: 'upstream closed' });
-  assert.equal(failures.length, 2);
+  await t.recovery;
+  assert.equal(failures.length, 0);
+  assert.ok(t.session);
   t.close();
   callbacks.onclose({ reason: 'late close' });
   callbacks.onerror(new Error('late error'));
-  assert.equal(failures.length, 2);
+  assert.equal(failures.length, 0);
 });
 
 test('translator closed while connecting disposes late session', async () => {

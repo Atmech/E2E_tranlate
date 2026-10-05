@@ -275,6 +275,43 @@ delay at the receiving endpoint too: pacer submission is not proof of playback
 or end-to-end translation latency. The offline clock regression simulates ten
 directions with shared stalls; it does not measure Asterisk or Gemini capacity.
 
+## Gemini connection recovery for long calls
+
+Each translation direction keeps its own logical Gemini session across WebSocket
+rotations. The translator enables `sessionResumption` and sliding-window context
+compression, saves the latest resumable handle, and reconnects on `GoAway`, socket
+error/close, or a synchronous send failure. This follows Google's
+[Live API session management](https://ai.google.dev/gemini-api/docs/live-api/session-management).
+No environment-variable changes are required.
+
+Every connection must receive `setupComplete` within five seconds before audio
+is sent. Recovery closes the previous SDK session before opening a replacement;
+callbacks from replaced sockets are ignored. It tries resumption up to three
+times, then one fresh session. The fresh fallback logs a warning because it resets
+translation context. Exhausted recovery or buffer overflow reports terminal
+failure through the existing call teardown path.
+
+During recovery, telephone media continues and the translator buffers up to ten
+seconds of PCM per direction (320,000 bytes), with a separate 1,000-message bound.
+Buffered speech drains in order at real-time speed; new speech joins behind it.
+Synthetic PTT release silence pauses until that backlog drains, then continues
+in real time. This avoids a reconnect burst but can add persistent delay during
+continuous speech; pauses allow the backlog to drain. Speech already sent to a
+lost connection is not replayed locally, so recovery does not guarantee lossless
+or duplicate-free audio at the handoff.
+
+`npm test` includes deterministic recovery tests for setup races, retries,
+fallback, stale callbacks, buffering/pacing, hangup, and four rotations across ten
+independent translator directions. These use fake Gemini sessions and do not
+prove live model compatibility or phone-call quality.
+
+Before deployment acceptance, repeat five concurrent 30-minute phone calls using
+the configured model. Verify both directions continue through multiple `GoAway`
+events, logs show `ready resumed=true`, and healthy rotations do not produce
+`Translator failed` or fresh-fallback warnings. Speak across each handoff and
+check for missing/repeated words, audible gaps, and accumulated delay, alongside
+the playback queue and pacing counters above. Also test hangup during recovery.
+
 ## Legacy browser demo latency tuning
 
 These browser/PTT settings apply to the legacy AudioSocket demo. Open the agent
