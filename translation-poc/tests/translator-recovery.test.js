@@ -7,13 +7,14 @@ import { int16ToB64 } from '../bridge/audio.js';
 const settle = async () => { for (let i = 0; i < 30; i++) await Promise.resolve(); };
 function harness(env = {}) {
   let time = 0, id = 0;
-  const timers = new Map(), calls = [], failures = [];
+  const timers = new Map(), calls = [], failures = [], logs = [];
   const timer = (fn, ms, repeat = false) => {
     timers.set(++id, { fn, ms, at: time + ms, repeat }); return id;
   };
   const context = vm.createContext({
-    console: { log() {}, warn() {}, error() {} }, Buffer, Int16Array, performance,
-    process: { env }, int16ToB64, Modality: { AUDIO: 'AUDIO' },
+    console: { log: (...args) => logs.push(args), warn: (...args) => logs.push(args), error: (...args) => logs.push(args) },
+    Buffer, Int16Array, performance: { now: () => time },
+    process: { env: { GEMINI_API_KEY: 'offline-test', ...env } }, int16ToB64, Modality: { AUDIO: 'AUDIO' },
     setTimeout: (fn, ms) => timer(fn, ms), clearTimeout: id => timers.delete(id),
     setInterval: (fn, ms) => timer(fn, ms, true), clearInterval: id => timers.delete(id),
     GoogleGenAI: class { live = { connect: options => new Promise((resolve, reject) => {
@@ -47,7 +48,7 @@ function harness(env = {}) {
     }
     time = end;
   };
-  return { t, calls, failures, timers, tick,
+  return { t, calls, failures, timers, logs, tick,
     async start() { const p = t.start(); calls[0].open(); calls[0].ready(); await p; },
     async ready(index = calls.length - 1) { calls[index].open(); calls[index].ready(); await settle(); },
     async rotate(handle = 'handle') {
@@ -82,14 +83,22 @@ test('GoAway resumes latest handle; stale callbacks cannot kill call or emit aud
   assert.equal(h.calls.length, 2); h.t.close(); assert.equal(h.timers.size, 0);
 });
 
-test('buffered speech preserves order and drains at real-time pace ahead of new audio', async () => {
+test('reconnect backlog clears while continuous live input preserves every sample in order', async () => {
   const h = harness(); await h.start(); await h.rotate();
-  h.t.feed(pcm(1)); h.t.feed(pcm(2)); h.t.feed(pcm(3));
-  await h.ready(); h.t.feed(pcm(4));
-  assert.deepEqual(samples(h.calls[1]), [1]);
-  await h.tick(19); assert.deepEqual(samples(h.calls[1]), [1]);
-  await h.tick(41); assert.deepEqual(samples(h.calls[1]), [1, 2, 3, 4]);
-  assert.deepEqual(h.calls[1].sent.map(x => x.at), [0, 20, 40, 60]); h.t.close();
+  for (let i = 1; i <= 150; i++) h.t.feed(pcm(i)); // Three seconds spans every catch-up tier.
+  assert.equal(h.t.getStats().outboxMs, 3000);
+  await h.ready();
+  for (let i = 151; i <= 400; i++) { await h.tick(20); h.t.feed(pcm(i)); }
+  assert.equal(h.t.getStats().outboxMs, 0);
+  assert.equal(h.t.drainTimer, null);
+  assert.deepEqual(samples(h.calls[1]), Array.from({ length: 400 }, (_, i) => i + 1));
+  assert.equal(h.t.getStats().maxOutboxMs, 3000);
+  assert.equal(h.t.getStats().reconnectCount, 1);
+  assert.equal(h.failures.length, 0);
+  const count = h.calls[1].sent.length;
+  h.t.feed(pcm(401)); // Back on the immediate-send path.
+  assert.equal(h.calls[1].sent.length, count + 1);
+  h.t.close();
 });
 
 test('synthetic tail pauses through reconnect and backlog, then runs in real time', async () => {
@@ -218,4 +227,38 @@ test('synthetic tail retries failed silence after recovery rather than dropping 
   h.calls[0].throwSend = true; await h.tick(100); await h.ready(); await h.tick(2000);
   assert.equal(h.calls[1].sent.length, 21); assert.equal(h.calls[1].sent.at(-1).payload.audioStreamEnd, true);
   h.t.close();
+});
+
+
+test('invalid catch-up timing and timeout settings fail at startup', () => {
+  for (const env of [
+    { GEMINI_MIN_DRAIN_DELAY_MS: '20' },
+    { GEMINI_MIN_DRAIN_DELAY_MS: 'NaN' },
+    { GEMINI_MIN_DRAIN_DELAY_MS: '0' },
+    { GEMINI_CHUNK_SAMPLES: '16' },
+    { GEMINI_CATCHUP_MEDIUM_MS: '-1' },
+    { GEMINI_CATCHUP_HIGH_MS: 'NaN' },
+    { GEMINI_CATCHUP_MEDIUM_MS: '2000', GEMINI_CATCHUP_HIGH_MS: '500' },
+    { GEMINI_CONNECT_TIMEOUT_MS: 'NaN' },
+    { GEMINI_CONNECT_TIMEOUT_MS: '0' },
+  ]) assert.throws(() => harness(env), /must/);
+});
+
+test('transport diagnostics survive recovery and fatal logging before cleanup', async () => {
+  const h = harness(); await h.start();
+  h.calls[0].callbacks.onclose({ code: 1011, reason: 'remote failure', wasClean: false });
+  await settle();
+  const reconnect = h.logs.find(args => String(args[0]).includes('reconnecting #'));
+  assert.equal(reconnect[1].code, 1011);
+  assert.equal(reconnect[1].wasClean, false);
+  h.t.feed(pcm(1));
+  h.calls[1].callbacks.onerror({ message: 'quota exhausted', code: 429, status: 'RESOURCE_EXHAUSTED', details: 'test detail' });
+  await settle();
+  assert.equal(h.failures.length, 1);
+  assert.equal(h.failures[0].code, 429);
+  const fatal = h.logs.find(args => String(args[0]).includes('FATAL'))[1];
+  assert.equal(fatal.status, 'RESOURCE_EXHAUSTED');
+  assert.equal(fatal.details, 'test detail');
+  assert.equal(fatal.outboxBytes, 640);
+  assert.equal(h.t.outboxBytes, 0);
 });

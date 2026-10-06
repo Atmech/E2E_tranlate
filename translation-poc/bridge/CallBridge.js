@@ -37,7 +37,7 @@ export class CallBridge {
 
     // customer speech (CUSTOMER_LANG) -> agent hears AGENT_LANG
     this.toAgent = new Translator(AGENT_LANG, {
-      sourceLang: CUSTOMER_LANG,
+      sourceLang: CUSTOMER_LANG, callId, direction: 'caller->agent',
       onAudio: (i24) => this.sendToAgent(i24),
       onInputText: (t) => this.sendTranscript('customer', t),
       onOutputText: (t) => this.sendTranscript('agent-hears', t),
@@ -46,7 +46,7 @@ export class CallBridge {
     });
     // agent speech (AGENT_LANG) -> customer hears CUSTOMER_LANG
     this.toCustomer = new Translator(CUSTOMER_LANG, {
-      sourceLang: AGENT_LANG,
+      sourceLang: AGENT_LANG, callId, direction: 'agent->caller',
       onAudio: (i24) => this.sendToCall(i24),
       onInputText: (t) => this.sendTranscript('agent', t),
       onOutputText: (t) => this.sendTranscript('customer-hears', t),

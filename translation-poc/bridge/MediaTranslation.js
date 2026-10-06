@@ -82,7 +82,7 @@ export class CallTranslationSession {
         this.monitor?.leg(this.monitorId, role, { translator: 'starting' });
         const destination = this.legs.get(opposite(role));
         leg.translator = this.createTranslator(leg.targetLang, {
-          sourceLang: leg.sourceLang,
+          sourceLang: leg.sourceLang, callId: this.callId, direction: `${role}->${opposite(role)}`,
           onInputText: text => {
             this.monitor?.transcript(this.monitorId, role, 'recognized', text);
             console.log(`[stt ${this.callId} ${role}] ${text}`);
