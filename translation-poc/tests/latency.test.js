@@ -80,7 +80,7 @@ function loadModule(file, bindings, exports) {
   const source = fs.readFileSync(new URL(file, import.meta.url), 'utf8')
     .replace(/^import .*;\n/gm, '').replaceAll('export class ', 'class ');
   const context = vm.createContext({ console, Buffer, performance, Int16Array,
-    process: { env: {} }, ...bindings });
+    process: { env: { GEMINI_API_KEY: 'offline-test' } }, ...bindings });
   vm.runInContext(source + `\nthis.result = { ${exports} };`, context);
   return context.result;
 }
@@ -163,7 +163,7 @@ test('quick empty re-press still finishes the previous utterance on release', as
 test('general model still sends pending input directly followed by stream-end', async () => {
   const sent = [];
   const t = translator(async () => ({ sendRealtimeInput: m => sent.push(m) }), {
-    process: { env: { GEMINI_LIVE_MODEL: 'gemini-general-test' } },
+    process: { env: { GEMINI_API_KEY: 'offline-test', GEMINI_LIVE_MODEL: 'gemini-general-test' } },
   });
   await t.start(); t.feed(new Int16Array(128)); t.endInput();
   assert.equal(Buffer.from(sent[0].audio.data, 'base64').length, 256);

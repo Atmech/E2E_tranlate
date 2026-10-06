@@ -293,15 +293,44 @@ failure through the existing call teardown path.
 
 During recovery, telephone media continues and the translator buffers up to ten
 seconds of PCM per direction (320,000 bytes), with a separate 1,000-message bound.
-Buffered speech drains in order at real-time speed; new speech joins behind it.
+Buffered speech drains in order faster than real time while new speech joins
+behind it: 1.5x below 500ms queued, 2x from 500ms, and 4x from 2000ms. These
+rates describe local send pacing; event-loop delays can reduce actual throughput.
+Once the queue empties, live input returns immediately to direct sending.
 Synthetic PTT release silence pauses until that backlog drains, then continues
-in real time. This avoids a reconnect burst but can add persistent delay during
-continuous speech; pauses allow the backlog to drain. Speech already sent to a
-lost connection is not replayed locally, so recovery does not guarantee lossless
-or duplicate-free audio at the handoff.
+in real time. Speech already sent to a lost connection is not replayed locally,
+so recovery does not guarantee lossless or duplicate-free audio at the handoff.
+
+Logs include call ID, direction, reconnect count, queue high-water marks, and
+backlog-drained events. Fatal errors record queue state before cleanup, and
+transport errors retain available error/status and WebSocket close codes.
+`Translator.getStats()` exposes recovery and queue counters for consumers; these
+counters are not yet displayed in the monitor UI. `catchupMs` includes time spent
+waiting for reconnection, and `maxQueuedMs` is the lifetime high-water mark.
+
+Optional recovery settings (defaults require no `.env` changes):
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `GEMINI_RECONNECT_BUFFER_SECONDS` | `10` | Queued PCM limit, 1–60 seconds |
+| `GEMINI_RECONNECT_MAX_MESSAGES` | `1000` | Queue message limit, 100–10000 |
+| `GEMINI_CONNECT_TIMEOUT_MS` | `5000` | Setup timeout, integer 1–60000 ms |
+| `GEMINI_RESUME_ATTEMPTS` | `3` | Resumption attempts before fresh fallback, 0–10 |
+| `GEMINI_CATCHUP_FACTOR_LOW` | `1.5` | Drain multiplier below the medium threshold |
+| `GEMINI_CATCHUP_FACTOR_MEDIUM` | `2` | Drain multiplier at the medium threshold |
+| `GEMINI_CATCHUP_FACTOR_HIGH` | `4` | Drain multiplier at the high threshold |
+| `GEMINI_CATCHUP_MEDIUM_MS` | `500` | Medium queue threshold |
+| `GEMINI_CATCHUP_HIGH_MS` | `2000` | High queue threshold |
+| `GEMINI_MIN_DRAIN_DELAY_MS` | `2` | Minimum interval between queued sends |
+
+Factors must be finite, greater than 1, at most 10, and ordered low ≤ medium ≤ high.
+Thresholds must be positive and finite, with medium < high. Minimum drain delay
+must be finite, at least 1ms, and less than `GEMINI_CHUNK_SAMPLES / 16` milliseconds;
+otherwise startup fails because catch-up cannot outrun continuous full-chunk input.
 
 `npm test` includes deterministic recovery tests for setup races, retries,
-fallback, stale callbacks, buffering/pacing, hangup, and four rotations across ten
+fallback, stale callbacks, catch-up during continuous input, sample order, invalid
+timing settings, transport diagnostics, hangup, and four rotations across ten
 independent translator directions. These use fake Gemini sessions and do not
 prove live model compatibility or phone-call quality.
 
@@ -310,7 +339,9 @@ the configured model. Verify both directions continue through multiple `GoAway`
 events, logs show `ready resumed=true`, and healthy rotations do not produce
 `Translator failed` or fresh-fallback warnings. Speak across each handoff and
 check for missing/repeated words, audible gaps, and accumulated delay, alongside
-the playback queue and pacing counters above. Also test hangup during recovery.
+the playback queue and pacing counters above. Confirm the reconnect input queue
+returns to zero without shifting persistent delay into translated playback, and
+check translation quality while accelerated input is sent. Also test hangup during recovery.
 
 ## Legacy browser demo latency tuning
 
