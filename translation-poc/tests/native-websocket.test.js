@@ -11,7 +11,8 @@ function connect(t, { activeCalls = new Map(), agents = new Set(), init, mode = 
   ws.readyState = 1; ws.bufferedAmount = 0; ws.sent = [];
   ws.send = (data, options) => ws.sent.push({ data, options });
   ws.close = (code, reason) => {
-    ws.closeCode = code; ws.closeReason = reason; ws.readyState = 3; ws.emit('close');
+    ws.closeCode = code; ws.closeReason = reason; ws.readyState = 3;
+    ws.emit('close', code, Buffer.from(reason || ''));
   };
   let call;
   handleNativeConnection(ws, { activeCalls, agents, mode, createTranslator, createBridge: (id, sock, { pacer }) => {
@@ -49,6 +50,41 @@ for (const format of ['text', 'json']) test(`${format}: native setup, raw PCM bo
   assert.equal(c.activeCalls.size, 0);
   assert.equal(c.call.closed, true);
   assert.equal(c.call.sock.destroyed, true);
+});
+
+test('abnormal peer close is logged before paired-leg local cleanup', async t => {
+  const records = [];
+  for (const method of ['log', 'warn'])
+    t.mock.method(console, method, (message, details) => records.push({ message, details }));
+  const activeCalls = new Map();
+  const createTranslator = () => ({ async start() {}, close() {}, feed() {} });
+  const caller = connect(t, { activeCalls, mode: 'translation', createTranslator });
+  const agent = connect(t, { activeCalls, mode: 'translation', createTranslator });
+  const metadata = { CALL_ID: 'diag-pair', ROLE: 'caller', SOURCE_LANG: 'hi', TARGET_LANG: 'en' };
+  caller.control({ ...start, channel_variables: metadata });
+  agent.control({ ...start, channel_variables: { ...metadata, ROLE: 'agent', SOURCE_LANG: 'en', TARGET_LANG: 'hi' } });
+  await settle();
+  // Simulate an observed abnormal close, not a local close request.
+  agent.ws.readyState = 3;
+  agent.ws.emit('close', 1006, Buffer.alloc(0));
+  const closes = records.filter(record => record.message.endsWith('] WebSocket close'));
+  assert.equal(closes.length, 2);
+  assert.equal(closes[0].details.role, 'agent');
+  assert.equal(closes[0].details.code, 1006);
+  assert.equal(closes[0].details.localCloseRequested, false);
+  assert.equal(closes[1].details.role, 'caller');
+  assert.equal(closes[1].details.localCloseRequested, true);
+  assert.equal(closes[1].details.localCloseSource, 'sock.end');
+  assert.equal(activeCalls.size, 0);
+});
+
+test('local close preserves thrown WebSocket errors', t => {
+  const c = connect(t);
+  c.control(start);
+  const close = c.ws.close;
+  c.ws.close = () => { throw new Error('close failed'); };
+  assert.throws(() => c.call.sock.end(), /close failed/);
+  c.ws.close = close;
 });
 
 test('XOFF retains queued audio and XON resumes; partial PCM output is padded', t => {
