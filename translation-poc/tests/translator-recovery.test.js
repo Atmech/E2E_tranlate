@@ -14,7 +14,7 @@ function harness(env = {}) {
   const context = vm.createContext({
     console: { log: (...args) => logs.push(args), warn: (...args) => logs.push(args), error: (...args) => logs.push(args) },
     Buffer, Int16Array, performance: { now: () => time },
-    process: { env: { GEMINI_API_KEY: 'offline-test', ...env } }, int16ToB64, Modality: { AUDIO: 'AUDIO' },
+    process: { env: { GEMINI_API_KEY: 'offline-test', GEMINI_CLOSE_WAIT_MS: '0', GEMINI_RETRY_BASE_MS: '0', GEMINI_RETRY_JITTER_MS: '0', ...env } }, int16ToB64, Modality: { AUDIO: 'AUDIO' },
     setTimeout: (fn, ms) => timer(fn, ms), clearTimeout: id => timers.delete(id),
     setInterval: (fn, ms) => timer(fn, ms, true), clearInterval: id => timers.delete(id),
     GoogleGenAI: class { live = { connect: options => new Promise((resolve, reject) => {
@@ -24,7 +24,7 @@ function harness(env = {}) {
           if (call.throwSend) throw new Error('send failed');
           call.sent.push({ payload, at: time });
         },
-        close() { call.closed++; call.callbacks.onclose({ reason: 'intentional close' }); },
+        close() { call.closed++; if (!call.deferClose) call.callbacks.onclose({ reason: 'intentional close' }); },
       };
       call.open = () => resolve(call.session);
       call.ready = () => call.callbacks.onmessage({ setupComplete: {} });
@@ -295,4 +295,60 @@ test('health transitions track reconnection, fallback, catch-up and readiness', 
   assert.equal(h.t.getStats().state, 'ready');
   assert.equal(h.t.getStats().freshFallbackCount, 1);
   h.t.close(); assert.equal(h.t.getStats().state, 'closed');
+});
+
+const productionRecovery = {
+  GEMINI_CLOSE_WAIT_MS: '1000', GEMINI_RETRY_BASE_MS: '500', GEMINI_RETRY_JITTER_MS: '250',
+};
+
+test('replacement waits for close confirmation and backoff while retaining speech', async () => {
+  const h = harness({ ...productionRecovery, GEMINI_RETRY_JITTER_MS: '0' }); await h.start();
+  h.calls[0].deferClose = true;
+  await h.rotate(); h.t.feed(pcm(7));
+  await h.tick(100); assert.equal(h.calls.length, 1);
+  h.calls[0].close(); await settle();
+  await h.tick(499); assert.equal(h.calls.length, 1);
+  await h.tick(1); assert.equal(h.calls.length, 2);
+  h.calls[1].open(); await settle();
+  assert.equal(h.calls[1].sent.length, 0, 'setup acceptance still gates buffered audio');
+  h.calls[1].ready(); await settle(); await h.tick(100);
+  assert.deepEqual(samples(h.calls[1]), [7]);
+  assert.equal(h.t.getStats().state, 'ready'); h.t.close(); assert.equal(h.timers.size, 0);
+});
+
+test('missing close event has a bounded wait; stale close cannot kill replacement', async () => {
+  const h = harness(productionRecovery); await h.start(); h.calls[0].deferClose = true;
+  await h.rotate(); await h.tick(1500);
+  assert.equal(h.calls.length, 2); await h.ready();
+  h.calls[0].close(); await settle();
+  assert.equal(h.t.session, h.calls[1].session); assert.equal(h.failures.length, 0);
+  assert.ok(h.logs.some(args => String(args[0]).includes('close confirmed=false'))); h.t.close();
+});
+
+test('hangup cancels close wait and backoff without opening another socket', async () => {
+  for (const deferClose of [false, true]) {
+    const h = harness(productionRecovery); await h.start(); h.calls[0].deferClose = deferClose;
+    await h.rotate(); h.t.close(); await settle(); await h.tick(10000);
+    assert.equal(h.calls.length, 1); assert.equal(h.timers.size, 0); assert.equal(h.failures.length, 0);
+  }
+});
+
+test('production delays preserve fresh fallback inside continuous-audio buffer deadline', async () => {
+  const h = harness(productionRecovery); await h.start(); h.calls[0].deferClose = true;
+  await h.rotate();
+  for (let i = 0; i < 500 && !h.t.closed; i++) { h.t.feed(pcm(i)); await h.tick(20); }
+  assert.equal(h.calls.length, 5);
+  assert.equal(h.calls[4].config.sessionResumption.handle, undefined);
+  assert.equal(h.failures.length, 1); assert.match(h.failures[0].message, /timed out|deadline/);
+  assert.ok(h.t.getStats().maxOutboxMs < 10000); assert.equal(h.timers.size, 0);
+});
+
+test('retry backoff grows after explicit rejection and remains cancellable', async () => {
+  const h = harness({ ...productionRecovery, GEMINI_CLOSE_WAIT_MS: '0', GEMINI_RETRY_JITTER_MS: '0' });
+  await h.start(); await h.rotate(); await h.tick(500);
+  assert.equal(h.calls.length, 2);
+  h.calls[1].reject(Object.assign(new Error('conflict'), { code: 409 })); await settle();
+  await h.tick(999); assert.equal(h.calls.length, 2);
+  await h.tick(1); assert.equal(h.calls.length, 3);
+  await h.ready(); assert.equal(h.failures.length, 0); h.t.close();
 });

@@ -42,6 +42,16 @@ if (!Number.isInteger(RESUME_ATTEMPTS) || RESUME_ATTEMPTS < 0 || RESUME_ATTEMPTS
   throw new Error('GEMINI_RESUME_ATTEMPTS must be an integer between 0 and 10');
 }
 
+// Close confirmation and retry delays share the existing recovery/audio budget.
+const CLOSE_WAIT_MS = Number(process.env.GEMINI_CLOSE_WAIT_MS ?? 1000);
+const RETRY_BASE_MS = Number(process.env.GEMINI_RETRY_BASE_MS ?? 500);
+const RETRY_JITTER_MS = Number(process.env.GEMINI_RETRY_JITTER_MS ?? 250);
+for (const [name, value] of Object.entries({ GEMINI_CLOSE_WAIT_MS: CLOSE_WAIT_MS,
+  GEMINI_RETRY_BASE_MS: RETRY_BASE_MS, GEMINI_RETRY_JITTER_MS: RETRY_JITTER_MS })) {
+  if (!Number.isInteger(value) || value < 0 || value > 5000)
+    throw new Error(`${name} must be an integer between 0 and 5000`);
+}
+
 // IMPORTANT: queued audio must drain faster than real time after a reconnect.
 // If it drains at exactly 1x while new 1x audio continues to arrive, the queue never
 // catches up and timer/event-loop overhead makes it grow until the reconnect buffer fails.
@@ -278,7 +288,8 @@ export class Translator {
 
   async _connect(handle, timeoutMs = CONNECT_TIMEOUT_MS) {
     const started = performance.now();
-    const connection = { session: null, active: false, failed: false };
+    const connection = { session: null, active: false, failed: false, closed: false };
+    connection.closeSignal = new Promise(resolve => { connection.confirmClose = resolve; });
     this.connection = connection;
 
     let accept;
@@ -328,7 +339,12 @@ export class Translator {
             }
           },
           onerror: error => failed(transportError(error, 'Gemini socket error')),
-          onclose: event => failed(transportError(event, 'Gemini connection closed')),
+          onclose: event => {
+            // Confirm even stale/intentional closes without letting them affect a new session.
+            connection.closed = true;
+            connection.confirmClose();
+            failed(transportError(event, 'Gemini connection closed'));
+          },
         },
       }).then(session => {
         connection.session = session;
@@ -373,6 +389,7 @@ export class Translator {
     }
 
     connection.failed = true;
+    this.closingConnection = connection;
 
     try {
       connection.cancel?.(new Error('Gemini connection cancelled'));
@@ -385,6 +402,21 @@ export class Translator {
     } catch {
       // Already closed.
     }
+  }
+
+  // Both close confirmation and backoff must be cancellable on telephone hangup.
+  _recoveryWait(ms, signal) {
+    if (ms <= 0 || this.closed || this.failureRaised) return Promise.resolve();
+    return new Promise(resolve => {
+      const finish = () => {
+        clearTimeout(timer);
+        if (this.cancelRecoveryWait === finish) this.cancelRecoveryWait = null;
+        resolve();
+      };
+      const timer = setTimeout(finish, ms);
+      this.cancelRecoveryWait = finish;
+      signal?.then(finish);
+    });
   }
 
   _recover(reason) {
@@ -434,6 +466,26 @@ export class Translator {
         }
 
         try {
+          const slots = attempts - attempt + 1;
+          const closing = this.closingConnection;
+          this.closingConnection = null;
+          if (closing && !closing.closed) {
+            const waitMs = Math.max(0, Math.min(CLOSE_WAIT_MS,
+              (recoveryDeadline - performance.now()) / slots / 4));
+            await this._recoveryWait(waitMs, closing.closeSignal);
+            if (this.closed || this.failureRaised) return;
+            console.log(`${this._tag()} previous connection close confirmed=${closing.closed}`);
+          }
+          // Reserve at least half this attempt's share for setup, and preserve later slots.
+          const requestedDelay = fresh ? 0 : Math.min(2000, RETRY_BASE_MS * 2 ** attempt)
+            + Math.floor(Math.random() * (RETRY_JITTER_MS + 1));
+          const delayMs = Math.max(0, Math.floor(Math.min(requestedDelay,
+            (recoveryDeadline - performance.now()) / slots / 2)));
+          if (delayMs) {
+            console.log(`${this._tag()} reconnect attempt ${attempt + 1} backoffMs=${delayMs}`);
+            await this._recoveryWait(delayMs);
+          }
+          if (this.closed || this.failureRaised) return;
           const remainingMs = recoveryDeadline - performance.now();
           if (remainingMs < 1) throw new Error('Gemini recovery deadline exceeded');
           const attemptMs = Math.max(1, Math.floor(Math.min(CONNECT_TIMEOUT_MS,
@@ -807,6 +859,7 @@ export class Translator {
     if (this.closed) return;
 
     this.closed = true;
+    this.cancelRecoveryWait?.();
     this._setState(this.failureRaised ? 'failed' : 'closed');
     this._cancelInputTail();
     this._stopDrain();
