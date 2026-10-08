@@ -266,6 +266,9 @@ next callback, even if both events occur between ticks. A sampled blocked socket
 also resumes with a single frame. Queued speech remains available after a pause.
 The constructor option `maxCatchUpFrames` defaults to 4; 0 disables recovery.
 No environment-variable changes are required.
+Close confirmation and backoff reduce potential overlap; they are not proof that
+GoAway caused dashboard 409 counts. Validate against the same live test window.
+Playback backlog trimming remains disabled, preserving queued speech.
 
 Periodic playback samples and hangup statistics include:
 
@@ -295,9 +298,14 @@ Initial setup must receive `setupComplete` within five seconds before audio
 is sent. Recovery shares a deadline across all attempts, reserving 250ms of headroom
 below the smaller audio-byte or message-count buffer budget. Each attempt gets its
 share of the remaining deadline, capped by `GEMINI_CONNECT_TIMEOUT_MS`, so fresh
-fallback is attempted before continuous input fills the buffer. Recovery closes the previous SDK session before opening a replacement;
-callbacks from replaced sockets are ignored. It tries resumption up to three
-times, then one fresh session. The fresh fallback logs a warning because it resets
+fallback is attempted before continuous input fills the buffer. Recovery requests closure of the previous SDK session and waits for its close event
+before opening a replacement. The wait is bounded by `GEMINI_CLOSE_WAIT_MS` and
+the remaining recovery budget; a missing acknowledgement is logged and does not
+block recovery forever. Callbacks from replaced sockets cannot affect the new session.
+Resume attempts use 500/1000/2000ms backoff plus up to 250ms jitter, shortened when
+necessary to reserve setup time and later attempts within the same audio-buffer
+deadline. Telephone hangup cancels these waits. It tries resumption up to three
+times, then one fresh session without an additional backoff. The fresh fallback logs a warning because it resets
 translation context. Exhausted recovery or buffer overflow reports terminal
 failure through the existing call teardown path.
 
@@ -325,6 +333,9 @@ Optional recovery settings (defaults require no `.env` changes):
 | `GEMINI_RECONNECT_BUFFER_SECONDS` | `10` | Queued PCM limit, 1–60 seconds |
 | `GEMINI_RECONNECT_MAX_MESSAGES` | `1000` | Queue message limit, 100–10000 |
 | `GEMINI_CONNECT_TIMEOUT_MS` | `5000` | Setup timeout, integer 1–60000 ms |
+| `GEMINI_CLOSE_WAIT_MS` | `1000` | Maximum close-acknowledgement wait, 0–5000 ms; capped by recovery budget |
+| `GEMINI_RETRY_BASE_MS` | `500` | Base resume backoff, 0–5000 ms; exponential delay capped at 2000 ms before jitter and budget caps |
+| `GEMINI_RETRY_JITTER_MS` | `250` | Maximum additional resume jitter, 0–5000 ms |
 | `GEMINI_RESUME_ATTEMPTS` | `3` | Resumption attempts before fresh fallback, 0–10 |
 | `GEMINI_CATCHUP_FACTOR_LOW` | `1.5` | Drain multiplier below the medium threshold |
 | `GEMINI_CATCHUP_FACTOR_MEDIUM` | `2` | Drain multiplier at the medium threshold |
