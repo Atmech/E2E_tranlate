@@ -466,3 +466,57 @@ flow-control pauses, and hangup during recovery. Record heard latency, gaps,
 missing/repeated words, cross-call isolation, backlog drainage and resource
 cleanup against agreed thresholds. Local fake-model tests and synthetic silence
 are not evidence of phone audio quality or long-call capacity.
+
+## Cost-analysis logs
+
+The backend emits single-line JSON records prefixed `[gemini-cost]` at translator
+start, approximately once per minute while input arrives, and once at shutdown.
+Each record includes the actual configured model, UTC timestamp, call ID,
+direction, languages, connection-attempt number, elapsed time, reconnect/fallback
+counts, and cumulative audio durations in milliseconds:
+
+- `inputReceivedMs`: phone audio accepted by this translator, including silence.
+- `inputSubmittedMs`: audio accepted by the SDK send method, including replay of
+  buffered input and synthetic tail silence. Failed send calls are not counted;
+  successful SDK submission does not prove Google received or billed the audio.
+- `syntheticInputSubmittedMs`: synthetic tail silence, already included in inputSubmittedMs.
+- `outputReceivedMs`: audio received from Gemini (24kHz PCM), including audio in
+  interrupted messages. It does not prove delivery or playback to the listener.
+- `queuedInputMs` / `pendingInputMs`: unsent input remaining at snapshot time.
+- `usageReports`: number of usage metadata messages received; zero means missing
+  usage reports, not zero billed tokens.
+
+`[gemini-usage]` logs each received usageMetadata report separately, with token
+counts and modality breakdowns only. No transcript, audio payload, API key, or
+resumption handle is included. Reports are not summed or differenced: reconcile
+their semantics and actual model/SKU with Google billing before assigning a cost.
+The connection-attempt number distinguishes rotations and fresh fallbacks.
+
+For test analysis, export from before the first call through after the last call.
+Use one `end` record per call ID/direction; sample records are cumulative and must
+not be added to end records. Sum both directions' audio usage, but count each
+phone call's elapsed duration only once. An abruptly terminated process may lack
+end records; samples then provide partial coverage. Local counters exclude audio
+that was discarded before reaching Translator (see startupDroppedBytes).
+
+Audio-minute estimates can be calculated offline as submitted input minutes ×
+the model's input rate + received output minutes × its output rate. These are
+estimates, not invoices; pricing, context billing, credits, taxes, transcription,
+and other services must be reconciled separately. Pricing reference:
+https://ai.google.dev/gemini-api/docs/pricing
+
+The `/monitor` dashboard also displays a combined **Estimated Gemini audio spend**
+widget and per-call Health usage details. Estimates currently price only
+`gemini-3.5-live-translate-preview` at $0.00525/input minute and $0.0315/output
+minute (rates checked 2026-10-09). Unknown models are unpriced, missing measurements
+are flagged, and missing token reports show “Not reported”. Token counts shown are
+the latest report, not an accumulated bill. The estimate uses audio durations even
+when token metadata is absent. Hosting, telephony, taxes and other API charges are
+excluded. Rates should be reviewed when pricing changes.
+
+The dashboard total covers all tracked translation calls **since this server
+process started**, regardless of table filters. Completed-call totals survive
+history pruning, but all totals reset on process restart/redeploy. This is not an
+account-wide or historical billing ledger. Export server logs before redeploying
+for reconciliation across runs; individual call exports include model, audio
+minutes, latest token total, and combined estimated cost.

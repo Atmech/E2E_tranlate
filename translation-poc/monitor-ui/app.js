@@ -25,6 +25,12 @@ const hasIssues = call => call.issueCount > 0 || Object.values(call.legs).some(l
 const age = at => at ? `${Math.max(0, Math.floor((snapshot.at - at) / 1000))}s ago` : 'No activity yet';
 const setText = (el, text) => { if (el.textContent !== String(text)) el.textContent = text; };
 
+const money = value => `$${value.toFixed(4)}`;
+const costLabel = cost => !cost?.pricedDirections ? 'Not available' :
+  `${money(cost.estimatedUsd)}${cost.unpricedDirections || cost.missingDirections ? ' (partial)' : ''}`;
+const usageLabel = cost => !cost?.usageReports ? 'Not reported' :
+  `${cost.latestUsage?.totalTokenCount ?? 'Not reported'} (latest report; not a billed total)`;
+
 function matchesScope(call, scope) {
   if (scope === 'active') return call.endedAt === null;
   if (scope === 'ended') return call.endedAt !== null;
@@ -107,6 +113,7 @@ async function exportCall(call) {
     `Duration: ${Math.floor(seconds / 60)}m ${seconds % 60}s`,
     `End reason: ${call.endReason || 'Call is still active'}`,
     '',
+    `Combined estimated audio cost (USD; not an invoice): ${costLabel(call.cost)}`,
     'PARTICIPANT AND TRANSLATION STATUS',
   ];
   for (const role of ['caller', 'agent']) {
@@ -114,6 +121,8 @@ async function exportCall(call) {
     lines.push('', `${role.toUpperCase()} → ${role === 'caller' ? 'AGENT' : 'CALLER'}`);
     if (!leg) { lines.push('Participant: Not connected'); continue; }
     lines.push(
+      `Model: ${leg.cost?.model || 'Not reported'}; latest token report: ${usageLabel(leg.cost)}`,
+      `Audio sent/received minutes: ${leg.cost ? `${(leg.cost.inputSubmittedMs / 60000).toFixed(4)} / ${(leg.cost.outputReceivedMs / 60000).toFixed(4)}` : 'Not reported'}`,
       `Languages: ${leg.sourceLang || '—'} → ${leg.targetLang || '—'}`,
       `Connection: ${leg.connected ? 'Connected' : 'Disconnected'}`,
       `Translator: ${leg.translator || '—'}`,
@@ -156,6 +165,12 @@ async function exportCall(call) {
 function render() {
   if (!snapshot) return;
   for (const key of ['active', 'waiting', 'attention', 'failed']) $(key).textContent = snapshot.counts[key];
+  const spend = snapshot.cost;
+  $('spend-total').textContent = costLabel(spend);
+  $('spend-breakdown').textContent = spend ?
+    `Active ${money(spend.activeUsd)} · Completed ${money(spend.completedUsd)} · Input ${money(spend.inputUsd)} · Output ${money(spend.outputUsd)}` : 'Waiting for usage data…';
+  $('spend-coverage').textContent = spend ?
+    `${spend.calls} tracked calls since ${new Date(snapshot.startedAt).toLocaleString()} · ${spend.inputMinutes.toFixed(2)} input / ${spend.outputMinutes.toFixed(2)} output audio minutes · ${spend.unpricedDirections} unpriced / ${spend.missingDirections} unmeasured directions. Includes completed calls removed from history.` : '';
   const calls = snapshot.calls.filter(call =>
     [call.callId, ...Object.values(call.legs).flatMap(leg => [leg.sourceLang, leg.targetLang, language(leg.sourceLang), language(leg.targetLang)])].join(' ').toLowerCase().includes($('search').value.trim().toLowerCase()) &&
     matchesScope(call, $('scope').value) &&
@@ -233,6 +248,7 @@ function renderDetail() {
   if (call.endReason) detail.append(node('p', call.endReason, call.state === 'failed' ? 'error' : 'muted'));
   else if (hasIssues(call)) detail.append(node('p', call.lastIssue?.message || 'Playback needs attention. Check the Health tab.', 'warning'));
   if (detailTab === 'health') {
+    detail.append(node('p', `Combined estimated audio cost: ${costLabel(call.cost)} · both directions`, 'detail-note'));
     const directions = node('div', undefined, 'directions');
     for (const role of ['caller', 'agent']) {
       const leg = call.legs[role];
@@ -241,6 +257,11 @@ function renderDetail() {
       if (!leg) { card.append(node('p', 'Participant has not connected', 'muted')); directions.append(card); continue; }
       const list = node('dl');
       for (const [label, value] of [
+        ['Estimated audio cost', leg.cost?.estimatedUsd == null ? 'Not available' : money(leg.cost.estimatedUsd)],
+        ['Model', leg.cost?.model || 'Not reported'],
+        ['Audio minutes sent / received', leg.cost ? `${(leg.cost.inputSubmittedMs / 60000).toFixed(2)} / ${(leg.cost.outputReceivedMs / 60000).toFixed(2)}` : 'Not reported'],
+        ['Token total', usageLabel(leg.cost)],
+        ['Usage reports received', leg.cost?.usageReports ?? 'Not reported'],
         ['Languages', `${language(leg.sourceLang)} → ${language(leg.targetLang)}`],
         ['Connection', leg.connected ? 'Connected' : 'Disconnected'],
         ['Translator', ({ catching_up: 'Catching up', recovering: 'Reconnecting', connecting: 'Connecting', ready: 'Ready', failed: 'Failed', closed: 'Closed' })[leg.translator] || leg.translator || '—'],

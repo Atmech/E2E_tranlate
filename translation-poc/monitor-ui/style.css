@@ -94,3 +94,5 @@ footer { font-size:10px; gap:20px; }
   .detail-tabs { gap:24px; padding:0 16px; } .issue-item { padding:12px 14px; }
 }
 @media(prefers-reduced-motion:reduce) { button { transition:none; } }
+
+.spend-panel{margin-bottom:18px}.spend-body{padding:0 20px 16px}.spend-body p{overflow-wrap:anywhere}.spend-panel strong{font-size:26px;color:var(--green);font-variant-numeric:tabular-nums;white-space:nowrap}.spend-panel .panel-heading{flex-wrap:wrap;gap:12px}

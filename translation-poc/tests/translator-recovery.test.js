@@ -352,3 +352,44 @@ test('retry backoff grows after explicit rejection and remains cancellable', asy
   await h.tick(1); assert.equal(h.calls.length, 3);
   await h.ready(); assert.equal(h.failures.length, 0); h.t.close();
 });
+
+const costRecords = (h, prefix = '[gemini-cost] ') => h.logs
+  .filter(args => String(args[0]).startsWith(prefix))
+  .map(args => JSON.parse(args[0].slice(prefix.length)));
+
+test('cost logs count submitted audio once across send failure, replay and synthetic tail', async () => {
+  const h = harness(); await h.start();
+  h.calls[0].message({ sessionResumptionUpdate: { resumable: true, newHandle: 'private-handle' } });
+  h.calls[0].throwSend = true; h.t.feed(pcm(7)); await settle();
+  await h.ready(); h.t.endInput(); await h.tick(2000);
+  h.calls[1].message({serverContent:{modelTurn:{parts:[{inlineData:{data:Buffer.alloc(4800).toString('base64')}}]}}});
+  h.t.close(); h.t.close();
+  const records = costRecords(h); assert.equal(records.filter(x=>x.event==='end').length,1);
+  const end=records.at(-1);
+  assert.equal(end.inputReceivedMs,20); assert.equal(end.inputSubmittedMs,2020);
+  assert.equal(end.syntheticInputSubmittedMs,2000); assert.equal(end.outputReceivedMs,100);
+  assert.equal(end.connectionAttempt,2); assert.equal(end.queuedInputMs,0);
+  assert.ok(!JSON.stringify(records).includes('private-handle'));
+});
+
+test('usage metadata is captured without serverContent, not summed, and excludes content', async () => {
+  const h = harness(); await h.start();
+  for (const n of [100,100,20]) h.calls[0].message({usageMetadata:{totalTokenCount:n,
+    promptTokensDetails:[{modality:'AUDIO',tokenCount:n, secret:'private'}],
+    privateText:'private', responseTokenCount:-1}});
+  const reports=costRecords(h,'[gemini-usage] ');
+  assert.deepEqual(reports.map(x=>x.usage.totalTokenCount),[100,100,20]);
+  assert.equal(reports[0].usage.responseTokenCount,undefined);
+  assert.ok(!JSON.stringify(reports).includes('private'));
+  h.t.close(); assert.equal(costRecords(h).at(-1).usageReports,3);
+});
+
+test('cost summaries retain unsent input on failure and are sampled at most once per minute', async () => {
+  const h=harness(); await h.start(); h.t.feed(pcm(1)); await h.tick(60000); h.t.feed(pcm(2));
+  assert.equal(costRecords(h).filter(x=>x.event==='sample').length,1);
+  await h.rotate(); h.t.feed(pcm(3));
+  for(let i=1;i<=4;i++){h.calls[i].reject(new Error('unavailable'));await settle();}
+  const end=costRecords(h).at(-1);
+  assert.equal(end.event,'end');assert.equal(end.failed,true);
+  assert.equal(end.inputReceivedMs,60);assert.equal(end.inputSubmittedMs,40);assert.equal(end.queuedInputMs,20);
+});

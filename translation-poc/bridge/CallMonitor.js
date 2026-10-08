@@ -3,9 +3,38 @@ import { randomUUID } from 'node:crypto';
 export function translatorTelemetry(translator) {
   const stats = translator?.getStats?.();
   if (!stats) return {};
+  const rates = AUDIO_RATES[stats.cost?.model];
+  const cost = stats.cost ? { ...stats.cost, estimatedUsd: rates
+    ? stats.cost.inputSubmittedMs / 60000 * rates.input + stats.cost.outputReceivedMs / 60000 * rates.output
+    : null } : undefined;
   return { translator: stats.state, reconnectCount: stats.reconnectCount,
     freshFallbackCount: stats.freshFallbackCount, inputQueueMs: stats.outboxMs,
-    maxInputQueueMs: stats.maxOutboxMs, recoveryMs: stats.recoveryMs };
+    maxInputQueueMs: stats.maxOutboxMs, recoveryMs: stats.recoveryMs, cost };
+}
+
+// Audio-duration estimate only. Rates verified 2026-10-09; unsupported models remain unpriced.
+const AUDIO_RATES = { 'gemini-3.5-live-translate-preview': { input: 0.00525, output: 0.0315 } };
+const emptyCost = () => ({ estimatedUsd: 0, inputUsd: 0, outputUsd: 0, inputMinutes: 0,
+  outputMinutes: 0, pricedDirections: 0, unpricedDirections: 0, missingDirections: 0,
+  usageReports: 0, calls: 0 });
+const addCost = (total, cost) => { for (const key of Object.keys(total)) total[key] += cost[key]; return total; };
+function callCost(call) {
+  const total = emptyCost();
+  if (call.mode !== 'translation') return total;
+  total.calls = 1;
+  for (const role of ['caller', 'agent']) {
+    const cost = call.legs[role]?.cost;
+    if (!cost) { total.missingDirections++; continue; }
+    const input = cost.inputSubmittedMs / 60000, output = cost.outputReceivedMs / 60000;
+    total.inputMinutes += input; total.outputMinutes += output;
+    total.usageReports += cost.usageReports;
+    const rates = AUDIO_RATES[cost.model];
+    if (!rates) { total.unpricedDirections++; continue; }
+    total.pricedDirections++;
+    total.inputUsd += input * rates.input; total.outputUsd += output * rates.output;
+  }
+  total.estimatedUsd = total.inputUsd + total.outputUsd;
+  return total;
 }
 
 // Provider messages may contain request bodies, URLs or credentials. Keep a safe
@@ -28,6 +57,7 @@ export class CallMonitor {
     Object.assign(this, { now, historyLimit, eventLimit, issueLimit, retentionMs,
       maxTextChars, maxTextEntries, maxTextChunkChars });
     this.startedAt = now();
+    this.completedCost = emptyCost();
     this.calls = new Map();
     this.readers = new Map();
     // Speech text stays out of the broad snapshot and live event stream.
@@ -119,6 +149,7 @@ export class CallMonitor {
     call.endedAt = this.now();
     call.state = failed ? 'failed' : 'ended';
     call.endReason = reason;
+    addCost(this.completedCost, callCost(call));
     for (const leg of Object.values(call.legs)) leg.connected = false;
     this.prune();
   }
@@ -139,8 +170,13 @@ export class CallMonitor {
   snapshot() {
     this.prune();
     for (const id of this.readers.keys()) this.sample(id);
-    const calls = [...this.calls.values()];
+    const calls = [...this.calls.values()].map(call => ({ ...call, cost: callCost(call) }));
+    const activeCost = calls.filter(call => call.endedAt === null)
+      .reduce((total, call) => addCost(total, call.cost), emptyCost());
+    const cost = addCost({ ...this.completedCost }, activeCost);
     return { at: this.now(), startedAt: this.startedAt,
+      cost: { ...cost, activeUsd: activeCost.estimatedUsd, completedUsd: this.completedCost.estimatedUsd,
+        ratesAsOf: '2026-10-09', currency: 'USD' },
       retention: { hours: this.retentionMs / 3600000, calls: this.historyLimit },
       counts: {
         active: calls.filter(c => c.endedAt === null).length,
