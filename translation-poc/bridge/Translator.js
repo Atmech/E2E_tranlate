@@ -159,6 +159,14 @@ export class Translator {
     this.freshFallbackCount = 0;
     this.onFailure = onFailure || (() => {});
 
+    this.costStartedAt = null;
+    this.costLastLogAt = null;
+    this.costConnectionAttempt = 0;
+    this.costUsageReports = 0;
+    this.costInputMs = 0;
+    this.costSubmittedMs = 0;
+    this.costSyntheticMs = 0;
+    this.costOutputMs = 0;
     this.callId = callId || null;
     this.direction = direction || null;
 
@@ -265,6 +273,8 @@ export class Translator {
   async start() {
     if (this.closed || this.started) return;
     this.started = true;
+    this.costStartedAt = performance.now();
+    this._logCost('start');
     this._setState('connecting');
 
     if (!API_KEY) {
@@ -288,6 +298,7 @@ export class Translator {
 
   async _connect(handle, timeoutMs = CONNECT_TIMEOUT_MS) {
     const started = performance.now();
+    this.costConnectionAttempt++;
     const connection = { session: null, active: false, failed: false, closed: false };
     connection.closeSignal = new Promise(resolve => { connection.confirmClose = resolve; });
     this.connection = connection;
@@ -606,6 +617,7 @@ export class Translator {
     ) {
       try {
         this.session.sendRealtimeInput(payload);
+        this.costSubmittedMs += bytes / INPUT_BYTES_PER_MS;
         return;
       } catch (error) {
         // Preserve this payload. _recover() disposes the failed socket, then the payload is
@@ -644,6 +656,7 @@ export class Translator {
     // sendRealtimeInput() is synchronous at this call boundary. Only remove the item after
     // the SDK accepted the send call; if it throws, the item remains queued for recovery.
     this.session.sendRealtimeInput(item.payload);
+    this.costSubmittedMs += item.bytes / INPUT_BYTES_PER_MS;
 
     this.outbox.shift();
     this.outboxBytes -= item.bytes;
@@ -683,8 +696,35 @@ export class Translator {
       this.resumeHandle = update.newHandle;
     }
 
+    if (m.usageMetadata) {
+      // Preserve individual reports: do not assume cumulative vs per-response billing.
+      const usage = {};
+      for (const key of ['promptTokenCount', 'responseTokenCount', 'totalTokenCount',
+        'cachedContentTokenCount', 'thoughtsTokenCount', 'toolUsePromptTokenCount']) {
+        const value = m.usageMetadata[key];
+        if (Number.isFinite(value) && value >= 0) usage[key] = value;
+      }
+      for (const key of ['promptTokensDetails', 'responseTokensDetails', 'cacheTokensDetails',
+        'toolUsePromptTokensDetails']) {
+        const details = m.usageMetadata[key];
+        if (Array.isArray(details)) usage[key] = details.filter(x =>
+          ['AUDIO', 'TEXT', 'IMAGE', 'VIDEO', 'DOCUMENT', 'MODALITY_UNSPECIFIED'].includes(x?.modality)
+          && Number.isFinite(x.tokenCount) && x.tokenCount >= 0
+        ).map(x => ({ modality: x.modality, tokenCount: x.tokenCount }));
+      }
+      this.costUsageReports++;
+      console.log('[gemini-usage] ' + JSON.stringify({
+        ...this._costIdentity(), report: this.costUsageReports, usage,
+      }));
+    }
+
     const sc = m.serverContent;
     if (!sc) return;
+    // Count received/generated audio even if an interruption prevents playback.
+    for (const part of sc.modelTurn?.parts || []) {
+      if (part.inlineData?.data)
+        this.costOutputMs += Buffer.byteLength(part.inlineData.data, 'base64') / 48;
+    }
     if (sc.interrupted) { this.onInterrupted(); return; }
 
     if (sc.inputTranscription?.text) {
@@ -728,6 +768,8 @@ export class Translator {
   feed(int16_16k) {
     if (this.closed || !this.started || !int16_16k.length) return;
 
+    this.costInputMs += int16_16k.length / 16;
+    if (performance.now() - this.costLastLogAt >= 60000) this._logCost('sample');
     this.beginInput();
     this.inputOpen = true;
 
@@ -823,6 +865,8 @@ export class Translator {
           },
         });
 
+        this.costSubmittedMs += INPUT_TAIL_MS;
+        this.costSyntheticMs += INPUT_TAIL_MS;
         if (--remaining === 0) {
           this._cancelInputTail();
           this._send({ audioStreamEnd: true });
@@ -832,6 +876,25 @@ export class Translator {
         this._recover(error);
       }
     }, INPUT_TAIL_MS);
+  }
+
+  _costIdentity() {
+    return { schemaVersion: 1, timestamp: new Date().toISOString(), model: MODEL,
+      callId: this.callId, direction: this.direction, sourceLang: this.sourceLang,
+      targetLang: this.targetLang, connectionAttempt: this.costConnectionAttempt };
+  }
+
+  _logCost(event) {
+    const now = performance.now();
+    this.costLastLogAt = now;
+    console.log('[gemini-cost] ' + JSON.stringify({ ...this._costIdentity(), event,
+      elapsedMs: this.costStartedAt === null ? 0 : Math.round(now - this.costStartedAt),
+      inputReceivedMs: this.costInputMs, inputSubmittedMs: this.costSubmittedMs,
+      syntheticInputSubmittedMs: this.costSyntheticMs, outputReceivedMs: this.costOutputMs,
+      usageReports: this.costUsageReports, reconnectCount: this.reconnectCount,
+      freshFallbackCount: this.freshFallbackCount, pendingInputMs: this.pending.length / 16,
+      queuedInputMs: Math.round(this._queuedMs()), failed: this.failureRaised,
+    }));
   }
 
   getStats() {
@@ -858,6 +921,7 @@ export class Translator {
   close() {
     if (this.closed) return;
 
+    if (this.started) this._logCost('end');
     this.closed = true;
     this.cancelRecoveryWait?.();
     this._setState(this.failureRaised ? 'failed' : 'closed');
