@@ -155,7 +155,7 @@ test('missing handle rotates immediately to fresh session', async () => {
 
 test('stalled setup times out; late session is disposed without activation', async () => {
   const h = harness(); await h.start(); await h.rotate(); await h.tick(5000);
-  assert.equal(h.calls.length, 3); h.calls[1].open(); h.calls[1].ready(); await settle();
+  assert.equal(h.calls.length, 4); h.calls[1].open(); h.calls[1].ready(); await settle();
   assert.equal(h.calls[1].closed, 1); assert.equal(h.t.session, null);
   await h.ready(); h.t.close();
 });
@@ -261,4 +261,38 @@ test('transport diagnostics survive recovery and fatal logging before cleanup', 
   assert.equal(fatal.details, 'test detail');
   assert.equal(fatal.outboxBytes, 640);
   assert.equal(h.t.outboxBytes, 0);
+});
+
+test('continuous speech exercises every timed-out resume and fresh attempt before the audio buffer fills', async () => {
+  const h = harness(); await h.start(); await h.rotate();
+  for (let i = 0; i < 500 && !h.t.closed; i++) { h.t.feed(pcm(i)); await h.tick(20); }
+  assert.equal(h.calls.length, 5, 'initial session, three resume attempts, one fresh fallback');
+  assert.equal(h.calls[4].config.sessionResumption.handle, undefined);
+  assert.equal(h.failures.length, 1);
+  assert.match(h.failures[0].message, /timed out|deadline/);
+  assert.ok(h.t.getStats().maxOutboxMs < 10000);
+  assert.equal(h.timers.size, 0);
+});
+
+test('general Live interpretation disables source-triggered interruption and propagates explicit cancellation', async () => {
+  const h = harness({ GEMINI_LIVE_MODEL: 'general-live' }); await h.start();
+  assert.equal(h.calls[0].config.realtimeInputConfig.activityHandling, 'NO_INTERRUPTION');
+  let interrupted = 0, audio = 0;
+  h.t.onInterrupted = () => interrupted++; h.t.onAudio = () => audio++;
+  h.calls[0].message({ serverContent: { interrupted: true, modelTurn: { parts: [{ inlineData: { data: 'AAA=' } }] } } });
+  assert.equal(interrupted, 1); assert.equal(audio, 0); h.t.close();
+});
+
+test('health transitions track reconnection, fallback, catch-up and readiness', async () => {
+  const h = harness(); const transitions = [];
+  h.t.onStateChange = (state, details) => transitions.push({ state, ...details });
+  await h.start(); await h.rotate(); h.t.feed(pcm(1)); h.t.feed(pcm(2));
+  for (let i = 1; i <= 3; i++) { h.calls[i].reject(new Error('invalid handle')); await settle(); }
+  await h.ready(); await h.tick(100);
+  assert.ok(transitions.some(x => x.state === 'recovering'));
+  assert.ok(transitions.some(x => x.freshFallback));
+  assert.ok(transitions.some(x => x.state === 'catching_up'));
+  assert.equal(h.t.getStats().state, 'ready');
+  assert.equal(h.t.getStats().freshFallbackCount, 1);
+  h.t.close(); assert.equal(h.t.getStats().state, 'closed');
 });

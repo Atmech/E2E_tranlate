@@ -3,7 +3,7 @@ services:
     name: e2e-translate-bridge
     runtime: node
     rootDir: translation-poc
-    buildCommand: npm install
+    buildCommand: npm ci --ignore-scripts
     startCommand: npm start
     envVars:
       - key: GEMINI_API_KEY

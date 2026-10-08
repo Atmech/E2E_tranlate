@@ -1,5 +1,13 @@
 import { randomUUID } from 'node:crypto';
 
+export function translatorTelemetry(translator) {
+  const stats = translator?.getStats?.();
+  if (!stats) return {};
+  return { translator: stats.state, reconnectCount: stats.reconnectCount,
+    freshFallbackCount: stats.freshFallbackCount, inputQueueMs: stats.outboxMs,
+    maxInputQueueMs: stats.maxOutboxMs, recoveryMs: stats.recoveryMs };
+}
+
 // Provider messages may contain request bodies, URLs or credentials. Keep a safe
 // classification, never the raw message, transcript, audio, stack or SDK object.
 export function failureCause(error) {
@@ -69,6 +77,7 @@ export class CallMonitor {
   }
 
   getTranscript(id) {
+    this.prune();
     if (!this.calls.has(id)) return null;
     const history = this.transcripts.get(id);
     return { records: history.records, omitted: history.omitted };
@@ -137,7 +146,7 @@ export class CallMonitor {
         active: calls.filter(c => c.endedAt === null).length,
         waiting: calls.filter(c => ['waiting', 'starting'].includes(c.state)).length,
         attention: calls.filter(c => c.endedAt === null && (c.issueCount ||
-          Object.values(c.legs).some(l => l.paused || l.queueMs >= 3000))).length,
+          Object.values(c.legs).some(l => l.paused || l.queueMs >= 3000 || ['recovering', 'catching_up', 'failed'].includes(l.translator)))).length,
         failed: calls.filter(c => c.state === 'failed').length,
       }, calls, issues: this.issues };
   }

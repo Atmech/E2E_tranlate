@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import vm from 'node:vm';
 import { EventEmitter } from 'node:events';
-import { CallMonitor, failureCause } from '../bridge/CallMonitor.js';
+import { CallMonitor, failureCause, translatorTelemetry } from '../bridge/CallMonitor.js';
 import { OutputPacer, buildAudioFrame, createParser } from '../bridge/audiosocket.js';
 import * as audio from '../bridge/audio.js';
 
@@ -208,6 +208,7 @@ for (const transport of ['tcp', 'ws']) test(`${transport}: browser rebinds acros
     http: { createServer: () => new Server() }, path: { join: (...s) => s.join('/') },
     WebSocketServer: class extends Server { constructor() { super(); wsServers.push(this); } },
     CallBridge: Bridge, createParser, FRAME: { UUID: 1, AUDIO: 16, HANGUP: 0 },
+    ConnectionLimits: class { maxCalls = Infinity; track() {} },
     CallMonitor, createMonitorHandler: () => async () => false,
   });
   vm.runInContext(source + '\nthis.calls = activeCalls;', context);
@@ -281,7 +282,7 @@ function browser() {
       close() { this.readyState = 3; this.onclose?.(); }
     },
     navigator: { mediaDevices: { getUserMedia: async () => ({ getTracks: () => [] }) } },
-    URL: { createObjectURL: () => 'blob:test', revokeObjectURL() {} }, Blob: class {},
+    URL: class extends URL { static createObjectURL() { return 'blob:test'; } static revokeObjectURL() {} }, Blob: class {},
     btoa: s => Buffer.from(s, 'binary').toString('base64'),
     atob: s => Buffer.from(s, 'base64').toString('binary'),
     setInterval: () => 1, clearInterval() {}, setTimeout: () => 1, clearTimeout() {},
@@ -322,7 +323,7 @@ test('reattaching same browser preserves PTT; closing another browser cannot det
   class Translator { async start() {} beginInput() {} endInput() { this.ended = true; } close() {} }
   const { CallBridge } = loadModule('../bridge/CallBridge.js', {
     Translator, OutputPacer: class { start() {} stop() {} },
-    WebSocket: { OPEN: 1 }, failureCause, ...audio,
+    WebSocket: { OPEN: 1 }, failureCause, translatorTelemetry, ...audio,
   }, 'CallBridge');
   const bridge = new CallBridge('test', {});
   await bridge.init();
@@ -405,4 +406,68 @@ test('translator closed while connecting disposes late session', async () => {
   await starting;
   assert.equal(closed, 1);
   assert.equal(t.session, null);
+});
+
+test('terminal legacy translator failure ends transport and both sessions exactly once', async () => {
+  const sessions = [];
+  class Translator {
+    constructor(lang, callbacks) { this.callbacks = callbacks; this.closes = 0; sessions.push(this); }
+    async start() {} close() { this.closes++; }
+  }
+  let ends = 0, removed = 0, stopped = 0;
+  const { CallBridge } = loadModule('../bridge/CallBridge.js', {
+    Translator, OutputPacer: class {}, WebSocket: { OPEN: 1 }, failureCause, translatorTelemetry, ...audio,
+  }, 'CallBridge');
+  const bridge = new CallBridge('terminal', { end() { ends++; } }, {
+    pacer: { start() {}, stop() { stopped++; } }, onClose() { removed++; },
+  });
+  await bridge.init();
+  sessions[0].callbacks.onFailure(new Error('provider unavailable'));
+  sessions[1].callbacks.onFailure(new Error('another failure'));
+  assert.equal(bridge.closed, true); assert.equal(bridge.ready, false);
+  assert.equal(ends, 1); assert.equal(removed, 1); assert.equal(stopped, 1);
+  assert.deepEqual(sessions.map(s => s.closes), [1, 1]);
+});
+
+test('provider interruption cancels browser playback immediately', async () => {
+  const b = browser(); await b.run('start()');
+  b.run('scheduleChunk(new Float32Array(2400))');
+  b.sockets[0].onmessage({ data: JSON.stringify({ type: 'interrupted', side: 'customer' }) });
+  assert.equal(b.sources[0].stopped, true);
+});
+
+for (const buffer of ['playback', 'browser', 'transport']) test(`legacy ${buffer} overflow tears down its call`, () => {
+  class Translator { close() {} }
+  const { CallBridge } = loadModule('../bridge/CallBridge.js', {
+    Translator, OutputPacer, WebSocket: { OPEN: 1 }, failureCause, translatorTelemetry, ...audio,
+  }, 'CallBridge');
+  let removed = 0, ended = 0;
+  const sock = { writable: true, writableLength: buffer === 'transport' ? 80001 : 0,
+    write() { assert.fail('overflow must not submit media'); }, end() { ended++; } };
+  const pacer = new OutputPacer(sock, { now: () => 0, logIntervalMs: 0 });
+  const bridge = new CallBridge('bounded', sock, { pacer, onClose() { removed++; } });
+  if (buffer === 'playback') { pacer.push(Buffer.alloc(16000 * 30)); bridge.sendToCall(new Int16Array(480)); }
+  if (buffer === 'browser') {
+    bridge.agentWs = { readyState: 1, bufferedAmount: 400000, terminate() {}, close() {},
+      send() { assert.fail('overflow must not submit text'); } };
+    bridge.sendTranscript('customer', 'example');
+  }
+  if (buffer === 'transport') { pacer.push(Buffer.alloc(320)); pacer.commit(); pacer._tick(); }
+  assert.equal(bridge.closed, true); assert.equal(removed, 1); assert.equal(ended, 1);
+  assert.equal(pacer.queuedBytes, 0);
+});
+
+test('legacy browser stays connected and can be reused after call teardown', async () => {
+  class Translator { async start() {} close() {} }
+  const { CallBridge } = loadModule('../bridge/CallBridge.js', {
+    Translator, OutputPacer: class {}, WebSocket: { OPEN: 1 }, failureCause, translatorTelemetry, ...audio,
+  }, 'CallBridge');
+  const sent = [];
+  const browser = { readyState: 1, send: data => sent.push(JSON.parse(data)),
+    close() { assert.fail('existing browser connection must survive call teardown'); } };
+  const makeCall = () => new CallBridge('legacy', { end() {} }, { pacer: { start() {}, stop() {} } });
+  const first = makeCall(); await first.init(); first.attachAgent(browser); first.close();
+  assert.equal(sent.at(-1).state, 'ended');
+  const second = makeCall(); await second.init(); second.attachAgent(browser);
+  assert.equal(sent.at(-1).state, 'connected'); second.close();
 });

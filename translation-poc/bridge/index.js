@@ -15,6 +15,7 @@ import { CallBridge } from './CallBridge.js';
 import { handleNativeConnection } from './native-websocket.js';
 import { CallMonitor } from './CallMonitor.js';
 import { createMonitorHandler } from './monitor-http.js';
+import { ConnectionLimits } from './connection-limits.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const UI_DIR = path.join(__dirname, '..', 'agent-ui');
@@ -29,6 +30,7 @@ if (!process.env.GEMINI_API_KEY) {
   process.exit(1);
 }
 
+const limits = new ConnectionLimits();
 const activeCalls = new Map(); // callId -> legacy CallBridge or paired CallTranslationSession
 const agents = new Set();      // currently connected agent WS sockets
 const monitor = new CallMonitor();
@@ -51,7 +53,7 @@ const tcp = net.createServer((sock) => {
           sock.end();
           return;
         }
-        bridge = new CallBridge(callId, sock, { monitor });
+        bridge = new CallBridge(callId, sock, { monitor, onClose: () => { if (activeCalls.get(callId) === bridge) activeCalls.delete(callId); } });
         activeCalls.set(callId, bridge);
         console.log(`[as] call up: ${callId}`);
         try {
@@ -134,10 +136,34 @@ const httpServer = http.createServer(async (req, res) => {
 // Both WS servers share one HTTP server, so use noServer + a single upgrade router.
 // (Attaching multiple WebSocketServer({server,path}) makes the first one 400 every
 //  upgrade whose path it doesn't own, before the second can handle it.)
-const wss = new WebSocketServer({ noServer: true });
+// Browser PCM is JSON/base64 (at most 100ms per normal message).
+const wss = new WebSocketServer({ noServer: true, maxPayload: 65536 });
 wss.on('connection', (ws) => {
+  limits.track(ws);
   console.log('[agent] connected');
   agents.add(ws);
+  let failed = false;
+  const detach = () => {
+    agents.delete(ws);
+    for (const call of activeCalls.values()) call.detachAgent?.(ws);
+  };
+  // ws emits an error for malformed protocol frames before closing the socket.
+  // Handle it locally; leaving this event unhandled terminates the whole process.
+  ws.on('error', () => {
+    failed = true;
+    detach();
+    monitor.event(null, 'error', 'Browser agent WebSocket error');
+  });
+  ws.on('close', () => {
+    detach();
+    console.log('[agent] disconnected');
+  });
+  const failMessage = () => {
+    failed = true;
+    detach();
+    monitor.event(null, 'error', 'Browser agent message processing failed');
+    ws.close(1011, 'Agent message processing failed');
+  };
   // Resolve on every message: a browser can stay connected across multiple calls.
   const bindToLiveCall = () => {
     const live = activeCalls.values().next().value;
@@ -145,42 +171,51 @@ wss.on('connection', (ws) => {
     live.attachAgent(ws); // idempotent; does not reset PTT for every audio packet
     return live;
   };
-  bindToLiveCall();
+  try { bindToLiveCall(); } catch { failMessage(); }
 
   ws.on('message', (raw) => {
+    if (failed) return;
     let msg;
     try { msg = JSON.parse(raw.toString()); } catch { return; }
     if (!msg || !['join', 'audio', 'ptt'].includes(msg.type)) return;
-    const bound = bindToLiveCall();
-    if (msg.type === 'join') {
-      ws.send(JSON.stringify({ type: 'joined', ok: !!bound, pending: activeCalls.size > 0 }));
-    } else if (msg.type === 'audio' && typeof msg.data === 'string') {
-      bound?.onAgentAudio(msg.data);
-    } else if (msg.type === 'ptt') {
-      bound?.setPtt(!!msg.active);
-    }
-  });
-
-  ws.on('close', () => {
-    agents.delete(ws);
-    for (const call of activeCalls.values()) call.detachAgent?.(ws);
-    console.log('[agent] disconnected');
+    try {
+      const bound = bindToLiveCall();
+      if (msg.type === 'join') {
+        ws.send(JSON.stringify({ type: 'joined', ok: !!bound, pending: activeCalls.size > 0 }));
+      } else if (msg.type === 'audio' && typeof msg.data === 'string') {
+        bound?.onAgentAudio(msg.data);
+      } else if (msg.type === 'ptt') {
+        bound?.setPtt(!!msg.active);
+      }
+    } catch { failMessage(); }
   });
 });
 
 // ---- WS /audiosocket (relay.js connects here instead of raw TCP) ----
 // Wraps each WS connection in a socket-like shim so CallBridge sees the same interface.
-const asWss = new WebSocketServer({ noServer: true });
+// Allow a full 65535-byte AudioSocket payload plus framing and coalesced frames.
+const asWss = new WebSocketServer({ noServer: true, maxPayload: 128 * 1024 });
 // Native chan_websocket uses raw PCM and text control events, not AudioSocket frames.
 const mediaWss = new WebSocketServer({ noServer: true, maxPayload: 65500 });
-mediaWss.on('connection', ws => handleNativeConnection(ws, {
-  activeCalls, agents, monitor,
-  createBridge: (id, sock, options) => new CallBridge(id, sock, { ...options, monitor }),
-}));
+mediaWss.on('connection', ws => {
+  limits.track(ws);
+  handleNativeConnection(ws, {
+    activeCalls, agents, monitor, maxCalls: limits.maxCalls,
+    createBridge: (id, sock, options) => new CallBridge(id, sock, { ...options, monitor }),
+  });
+});
 
 // Single upgrade handler routes by pathname to the right WS server.
 httpServer.on('upgrade', (req, socket, head) => {
-  const { pathname } = new URL(req.url, 'http://localhost');
+  let pathname;
+  try { pathname = new URL(req.url, 'http://localhost').pathname; }
+  catch { socket.destroy(); return; }
+  if (![AGENT_WS_PATH, AS_WS_PATH, '/media'].includes(pathname)) { socket.destroy(); return; }
+  const rejection = limits.checkUpgrade();
+  if (rejection) {
+    socket.end(`HTTP/1.1 ${rejection} Rejected\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`);
+    return;
+  }
   if (pathname === AGENT_WS_PATH) {
     wss.handleUpgrade(req, socket, head, (ws) => wss.emit('connection', ws, req));
   } else if (pathname === AS_WS_PATH) {
@@ -192,6 +227,7 @@ httpServer.on('upgrade', (req, socket, head) => {
   }
 });
 asWss.on('connection', (ws) => {
+  limits.track(ws);
   let bridge = null;
   let callId = null;
 
@@ -200,47 +236,62 @@ asWss.on('connection', (ws) => {
   const sockShim = {
     destroyed: false,
     writable: true,
+    get bufferedAmount() { return ws.bufferedAmount; },
     write(buf) { if (ws.readyState === ws.OPEN) ws.send(buf, { binary: true }); },
     end() { ws.close(); },
   };
 
   const parser = createParser(async (type, payload) => {
-    switch (type) {
-      case FRAME.UUID: {
-        if (bridge) { ws.close(); return; }
-        callId = payload.toString('hex');
-        if (activeCalls.size > 0) {
-          console.warn('[asws] rejecting concurrent call: single-call POC');
-          monitor.event(null, 'warning', 'Legacy relay call rejected: another call is active');
-          ws.close();
-          return;
+    try {
+      switch (type) {
+        case FRAME.UUID: {
+          if (bridge) { ws.close(); return; }
+          callId = payload.toString('hex');
+          if (activeCalls.size > 0) {
+            console.warn('[asws] rejecting concurrent call: single-call POC');
+            monitor.event(null, 'warning', 'Legacy relay call rejected: another call is active');
+            ws.close();
+            return;
+          }
+          bridge = new CallBridge(callId, sockShim, { monitor, onClose: () => { if (activeCalls.get(callId) === bridge) activeCalls.delete(callId); } });
+          activeCalls.set(callId, bridge);
+          console.log(`[asws] call up: ${callId}`);
+          try {
+            await bridge.init();
+            for (const agentWs of agents) bridge.attachAgent(agentWs);
+          } catch (e) {
+            console.error(`[asws] init failed for ${callId}:`, e?.message || e);
+            bridge.reportFailure?.('caller', e);
+            bridge.close('Translator setup failed', true);
+            if (activeCalls.get(callId) === bridge) activeCalls.delete(callId);
+            ws.close();
+          }
+          break;
         }
-        bridge = new CallBridge(callId, sockShim, { monitor });
-        activeCalls.set(callId, bridge);
-        console.log(`[asws] call up: ${callId}`);
-        try {
-          await bridge.init();
-          for (const agentWs of agents) bridge.attachAgent(agentWs);
-        } catch (e) {
-          console.error(`[asws] init failed for ${callId}:`, e?.message || e);
-          bridge.reportFailure?.('caller', e);
-          bridge.close('Translator setup failed', true);
-          if (activeCalls.get(callId) === bridge) activeCalls.delete(callId);
-          ws.close();
-        }
-        break;
+        case FRAME.AUDIO: bridge?.onCallAudio(payload); break;
+        case FRAME.DTMF: console.log(`[asws] dtmf ${callId}:`, payload.toString('ascii')); break;
+        case FRAME.HANGUP: teardown(); ws.close(); break;
+        case FRAME.ERROR:
+          monitor.event(bridge?.monitorId, 'error', 'Asterisk relay error frame');
+          console.error(`[asws] error frame ${callId}:`, payload); break;
+        default: break;
       }
-      case FRAME.AUDIO: bridge?.onCallAudio(payload); break;
-      case FRAME.DTMF: console.log(`[asws] dtmf ${callId}:`, payload.toString('ascii')); break;
-      case FRAME.HANGUP: teardown(); ws.close(); break;
-      case FRAME.ERROR:
-        monitor.event(bridge?.monitorId, 'error', 'Asterisk relay error frame');
-        console.error(`[asws] error frame ${callId}:`, payload); break;
-      default: break;
+    } catch {
+      monitor.event(bridge?.monitorId, 'error', 'Relay message processing failed');
+      teardown();
+      ws.close(1011, 'Relay message processing failed');
     }
   });
 
-  ws.on('message', (data) => parser(Buffer.isBuffer(data) ? data : Buffer.from(data)));
+  ws.on('message', (data) => {
+    if (sockShim.destroyed) return;
+    try { parser(Buffer.isBuffer(data) ? data : Buffer.from(data)); }
+    catch {
+      monitor.event(bridge?.monitorId, 'error', 'Relay frame parsing failed');
+      teardown();
+      ws.close(1011, 'Relay frame parsing failed');
+    }
+  });
   const teardown = () => {
     sockShim.destroyed = true; sockShim.writable = false;
     if (bridge && activeCalls.get(callId) === bridge) {

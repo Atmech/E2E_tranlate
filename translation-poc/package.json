@@ -9,12 +9,17 @@
     "monitor:password": "node scripts/monitor-password.js",
     "test:monitor-http": "node --test scripts/check-monitor-http.js",
     "test:media-ws": "node --test scripts/check-media-websocket.js",
+    "test:ws-hardening": "node --test scripts/check-websocket-hardening.js",
     "smoke": "node scripts/smoke-gemini.js",
-    "smoke:asterisk-ws": "node scripts/smoke-asterisk-ws.js"
+    "smoke:asterisk-ws": "node scripts/smoke-asterisk-ws.js",
+    "test:integration": "npm run test:media-ws && npm run test:monitor-http && npm run test:ws-hardening"
   },
   "dependencies": {
-    "@google/genai": "latest",
+    "@google/genai": "2.8.0",
     "ws": "^8.16.0",
     "dotenv": "^16.0.0"
+  },
+  "engines": {
+    "node": ">=22 <23"
   }
 }

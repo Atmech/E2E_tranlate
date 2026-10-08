@@ -131,6 +131,8 @@ export class Translator {
     onInputText,
     onOutputText,
     onTurnEnd,
+    onInterrupted,
+    onStateChange,
     onFailure,
     callId,
     direction,
@@ -141,6 +143,10 @@ export class Translator {
     this.onInputText = onInputText || (() => {});
     this.onOutputText = onOutputText || (() => {});
     this.onTurnEnd = onTurnEnd || (() => {});
+    this.onInterrupted = onInterrupted || (() => {});
+    this.onStateChange = onStateChange || (() => {});
+    this.state = 'waiting';
+    this.freshFallbackCount = 0;
     this.onFailure = onFailure || (() => {});
 
     this.callId = callId || null;
@@ -171,6 +177,13 @@ export class Translator {
     this.maxOutboxBytes = 0;
     this.maxOutboxMessages = 0;
     this.maxOutboxMs = 0;
+  }
+
+  _setState(state, details = {}) {
+    if (this.state === state && !details.freshFallback) return;
+    this.state = state;
+    try { this.onStateChange(state, details); }
+    catch { console.error(`${this._tag()} state observer failed`); }
   }
 
   _tag() {
@@ -227,6 +240,7 @@ export class Translator {
         echoTargetLanguage: false,
       };
     } else {
+      config.realtimeInputConfig = { activityHandling: 'NO_INTERRUPTION' };
       const from = this.sourceLang ? `from ${langName(this.sourceLang)} ` : '';
       config.systemInstruction = {
         parts: [{
@@ -241,6 +255,7 @@ export class Translator {
   async start() {
     if (this.closed || this.started) return;
     this.started = true;
+    this._setState('connecting');
 
     if (!API_KEY) {
       const error = new Error('GEMINI_API_KEY is not set');
@@ -261,7 +276,7 @@ export class Translator {
     }
   }
 
-  async _connect(handle) {
+  async _connect(handle, timeoutMs = CONNECT_TIMEOUT_MS) {
     const started = performance.now();
     const connection = { session: null, active: false, failed: false };
     this.connection = connection;
@@ -292,7 +307,7 @@ export class Translator {
 
     const timer = setTimeout(
       () => failed(new Error('Gemini setup timed out')),
-      CONNECT_TIMEOUT_MS,
+      timeoutMs,
     );
 
     try {
@@ -334,6 +349,7 @@ export class Translator {
 
       connection.active = true;
       this.session = session;
+      this._setState(this.outbox.length ? 'catching_up' : 'ready');
 
       console.log(
         `${this._tag()} ready resumed=${Boolean(handle)} ` +
@@ -379,7 +395,12 @@ export class Translator {
       : new Error(String(reason || 'Gemini connection failure'));
 
     this.reconnectCount += 1;
+    this._setState('recovering');
     this.reconnectStartedAt = performance.now();
+    // Leave headroom for new input and timer delays; budget every attempt, including fallback.
+    const budgetMs = Math.min(RECONNECT_BUFFER_SECONDS * 1000,
+      MAX_OUTBOX_MESSAGES * CHUNK_SAMPLES / 16) - 250;
+    const recoveryDeadline = this.reconnectStartedAt + budgetMs;
 
     console.warn(
       `${this._tag()} reconnecting #${this.reconnectCount}: ${recoveryError.message} ` +
@@ -404,6 +425,8 @@ export class Translator {
 
         if (fresh) {
           this.resumeHandle = null;
+          this.freshFallbackCount++;
+          this._setState('recovering', { freshFallback: true });
           console.warn(
             `${this._tag()} fresh-session fallback; translation context resets ` +
             `queuedMs=${Math.round(this._queuedMs())}`,
@@ -411,7 +434,11 @@ export class Translator {
         }
 
         try {
-          await this._connect(handle);
+          const remainingMs = recoveryDeadline - performance.now();
+          if (remainingMs < 1) throw new Error('Gemini recovery deadline exceeded');
+          const attemptMs = Math.max(1, Math.floor(Math.min(CONNECT_TIMEOUT_MS,
+            remainingMs / (attempts - attempt + 1))));
+          await this._connect(handle, attemptMs);
 
           if (this.closed) return;
           if (!this.session || this.connection?.failed) {
@@ -581,6 +608,7 @@ export class Translator {
         );
       }
       this.catchupStartedAt = null;
+      this._setState('ready');
       this.drainTimer = null;
       return;
     }
@@ -605,6 +633,7 @@ export class Translator {
 
     const sc = m.serverContent;
     if (!sc) return;
+    if (sc.interrupted) { this.onInterrupted(); return; }
 
     if (sc.inputTranscription?.text) {
       this.onInputText(sc.inputTranscription.text);
@@ -755,6 +784,9 @@ export class Translator {
 
   getStats() {
     return {
+      state: this.state,
+      freshFallbackCount: this.freshFallbackCount,
+      recoveryMs: this.reconnectStartedAt === null ? 0 : Math.round(performance.now() - this.reconnectStartedAt),
       closed: this.closed,
       started: this.started,
       failureRaised: this.failureRaised,
@@ -775,6 +807,7 @@ export class Translator {
     if (this.closed) return;
 
     this.closed = true;
+    this._setState(this.failureRaised ? 'failed' : 'closed');
     this._cancelInputTail();
     this._stopDrain();
 

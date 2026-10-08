@@ -436,6 +436,9 @@ async function start() {
         activeCustomerBubble = null;
         activeAgentBubble = null;
       }
+    } else if (msg.type === 'interrupted') {
+      clearPlayback();
+      handleTurnEnd(msg.side);
     } else if (msg.type === 'turn-end') {
       handleTurnEnd(msg.side);
     }

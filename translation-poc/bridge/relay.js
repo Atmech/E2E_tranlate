@@ -29,26 +29,32 @@ net.createServer((tcp) => {
   // remote bridge isn't open yet. Buffer everything until the WS opens, then flush in
   // order — otherwise the UUID frame is lost and the bridge never registers the call.
   const queue = [];
+  let queuedBytes = 0;
+  const openingTimer = setTimeout(() => { tcp.destroy(); ws.terminate(); }, 5000);
+  openingTimer.unref?.();
   ws.on('open', () => {
+    clearTimeout(openingTimer);
     console.log('[relay] ws open');
     for (const chunk of queue) ws.send(chunk, { binary: true });
-    queue.length = 0;
+    queue.length = 0; queuedBytes = 0;
   });
   ws.on('error', (e) => { console.error('[relay] ws error:', e.message); tcp.destroy(); });
   ws.on('close', () => { console.log('[relay] ws closed'); tcp.destroy(); });
 
   // Asterisk → bridge (queue until WS open, then stream)
   tcp.on('data', (chunk) => {
+    if (ws.bufferedAmount > 16000 * 5 || queuedBytes + chunk.length > 16000 * 10) { tcp.destroy(); ws.terminate(); return; }
     if (ws.readyState === WebSocket.OPEN) ws.send(chunk, { binary: true });
-    else queue.push(chunk);
+    else { queue.push(chunk); queuedBytes += chunk.length; }
   });
 
   // bridge → Asterisk
   ws.on('message', (data) => {
+    if (tcp.writableLength > 16000 * 5) { tcp.destroy(); ws.terminate(); return; }
     const buf = Buffer.isBuffer(data) ? data : Buffer.from(data);
     tcp.write(buf);
   });
 
-  tcp.on('close', () => { console.log('[relay] tcp closed'); ws.close(); });
+  tcp.on('close', () => { clearTimeout(openingTimer); queue.length = 0; console.log('[relay] tcp closed'); ws.close(); });
   tcp.on('error', (e) => { console.error('[relay] tcp error:', e.message); ws.close(); });
 }).listen(TCP_PORT, () => console.log(`[relay] listening on TCP :${TCP_PORT}`));

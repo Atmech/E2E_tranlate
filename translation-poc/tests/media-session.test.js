@@ -11,7 +11,7 @@ const mediaStart = (role, overrides = {}) => ({
     SOURCE_LANG: role === 'caller' ? 'hi' : 'en',
     TARGET_LANG: role === 'caller' ? 'en' : 'hi', ...overrides },
 });
-function harness(t, { start, setupTimeoutMs } = {}) {
+function harness(t, { start, setupTimeoutMs, maxCalls = Infinity } = {}) {
   const activeCalls = new Map(), translators = [];
   const createTranslator = (targetLang, callbacks) => {
     const translator = { targetLang, callbacks, feeds: [], closed: false,
@@ -33,7 +33,7 @@ function harness(t, { start, setupTimeoutMs } = {}) {
     };
     ws.control = event => ws.emit('message', Buffer.from(JSON.stringify(event)), false);
     ws.audio = pcm => ws.emit('message', pcm, true);
-    handleNativeConnection(ws, { activeCalls, mode: 'translation', createTranslator, setupTimeoutMs });
+    handleNativeConnection(ws, { activeCalls, mode: 'translation', createTranslator, setupTimeoutMs, maxCalls });
     t.after(() => ws.close(1000));
     if (role) ws.control(mediaStart(role, overrides));
     return ws;
@@ -69,14 +69,14 @@ for (const firstRole of ['caller', 'agent']) test(`pair ${firstRole} first; tran
   assert.equal(caller.sent.length, 0);
   assert.equal(agent.sent.length, 1);
   assert.equal(agent.sent[0].data.length, 320);
-  assert.equal(agent.sent[0].data.readInt16LE(0), 1200);
+  assert.equal(agent.sent[0].data.readInt16LE(318), 1200);
   assert.equal(agent.sent[0].options.binary, true);
   agent.audio(Buffer.alloc(320, 2));
   assert.equal(h.translator('agent').feeds.length, 1);
   output(h.translator('agent'), -900);
   h.session().legs.get('caller').pacer._tick();
   assert.equal(caller.sent.length, 1);
-  assert.equal(caller.sent[0].data.readInt16LE(0), -900);
+  assert.equal(caller.sent[0].data.readInt16LE(318), -900);
   caller.close(1000);
   assert.equal(agent.readyState, 3);
   assert.equal(h.activeCalls.size, 0);
@@ -135,7 +135,7 @@ for (const ending of ['hangup', 'translator failure']) test(`concurrent calls is
     output(translator, value);
     session.legs.get(role === 'caller' ? 'agent' : 'caller').pacer._tick();
     assert.equal(destination.sent.length, 1);
-    assert.equal(destination.sent[0].data.readInt16LE(0), value);
+    assert.equal(destination.sent[0].data.readInt16LE(318), value);
   }
   assert.equal(h.connect('caller', { CALL_ID: 'call-b' }).closeCode, 1008);
   assert.ok(a.ready && b.ready, 'duplicate participant must not close either call');
@@ -158,7 +158,7 @@ for (const ending of ['hangup', 'translator failure']) test(`concurrent calls is
   assert.equal(b.legs.get('caller').translator.feeds.length, 2);
   output(b.legs.get('caller').translator, 3100);
   b.legs.get('agent').pacer._tick();
-  assert.equal(agentB.sent[1].data.readInt16LE(0), 3100);
+  assert.equal(agentB.sent[1].data.readInt16LE(318), 3100);
 });
 
 test('CALL_ID collision preserves an existing incompatible bridge', t => {
@@ -177,7 +177,7 @@ test('recipient XOFF pauses only recipient output; XON resumes exact queued audi
   assert.equal(agent.sent.length, 0); assert.equal(agentPacer.queue.length, 320);
   assert.equal(caller.sent.length, 1);
   agent.control({ event: 'MEDIA_XON' }); agentPacer._tick();
-  assert.equal(agent.sent[0].data.readInt16LE(0), 1000);
+  assert.equal(agent.sent[0].data.readInt16LE(318), 1000);
 });
 
 test('disconnect during setup closes both translators and cannot revive session', async t => {
@@ -229,4 +229,23 @@ test('paused playback queue has a bound and slow transport closes both connectio
     assert.equal(caller.readyState, 3); assert.equal(agent.readyState, 3);
     assert.equal(h.activeCalls.size, 0);
   }
+});
+
+
+test('capacity rejects a new call while allowing the existing call to acquire its peer', async t => {
+  const h = harness(t, { maxCalls: 1 });
+  h.connect('caller');
+  const denied = h.connect('caller', { CALL_ID: 'another' });
+  assert.equal(denied.closeCode, 1008); assert.equal(h.activeCalls.size, 1);
+  h.connect('agent'); await settle();
+  assert.equal(h.session().ready, true); assert.equal(h.translators.length, 2);
+});
+test('interruption clears only the destination playback queue', async t => {
+  const h = harness(t); h.connect('caller'); h.connect('agent'); await settle();
+  output(h.translator('caller'), 700); output(h.translator('agent'), -700);
+  const caller = h.session().legs.get('caller'), agent = h.session().legs.get('agent');
+  let flushed = 0; agent.sock.flushPlayback = () => flushed++;
+  h.translator('caller').callbacks.onInterrupted();
+  assert.equal(agent.pacer.queuedBytes, 0); assert.equal(flushed, 1);
+  assert.ok(caller.pacer.queuedBytes > 0); assert.equal(h.session().ready, true);
 });

@@ -48,12 +48,12 @@ test('two real /media sockets negotiate media, pair and cross-route PCM', { time
   caller.send(Buffer.alloc(320, 1));
   const [toAgent, agentBinary] = await agentAudio;
   assert.equal(agentBinary, true); assert.equal(toAgent.length, 320);
-  assert.equal(toAgent.readInt16LE(0), 1111); assert.equal(callerMessages, 0);
+  assert.equal(toAgent.readInt16LE(318), 1111); assert.equal(callerMessages, 0);
   const callerAudio = once(caller, 'message');
   agent.send(Buffer.alloc(320, 2));
   const [toCaller, callerBinary] = await callerAudio;
   assert.equal(callerBinary, true); assert.equal(toCaller.length, 320);
-  assert.equal(toCaller.readInt16LE(0), -2222); assert.equal(agentMessages, 1);
+  assert.equal(toCaller.readInt16LE(318), -2222); assert.equal(agentMessages, 1);
   const closed = Promise.all(clients.map(ws => once(ws, 'close')));
   caller.close(1000); await closed;
   assert.equal(activeCalls.size, 0);
