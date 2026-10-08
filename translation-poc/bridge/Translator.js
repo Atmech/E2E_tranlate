@@ -163,6 +163,7 @@ export class Translator {
     this.costLastLogAt = null;
     this.costConnectionAttempt = 0;
     this.costUsageReports = 0;
+    this.costLatestUsage = null;
     this.costInputMs = 0;
     this.costSubmittedMs = 0;
     this.costSyntheticMs = 0;
@@ -713,6 +714,7 @@ export class Translator {
         ).map(x => ({ modality: x.modality, tokenCount: x.tokenCount }));
       }
       this.costUsageReports++;
+      this.costLatestUsage = usage;
       console.log('[gemini-usage] ' + JSON.stringify({
         ...this._costIdentity(), report: this.costUsageReports, usage,
       }));
@@ -899,6 +901,9 @@ export class Translator {
 
   getStats() {
     return {
+      cost: this.started ? { model: MODEL, inputSubmittedMs: this.costSubmittedMs,
+        outputReceivedMs: this.costOutputMs, syntheticInputSubmittedMs: this.costSyntheticMs,
+        usageReports: this.costUsageReports, latestUsage: this.costLatestUsage } : null,
       state: this.state,
       freshFallbackCount: this.freshFallbackCount,
       recoveryMs: this.reconnectStartedAt === null ? 0 : Math.round(performance.now() - this.reconnectStartedAt),

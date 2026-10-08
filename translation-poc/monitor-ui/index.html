@@ -27,6 +27,12 @@
     <button data-filter="attention" aria-pressed="false"><span class="metric-label">Needs attention <span aria-hidden="true">↗</span></span><strong id="attention">—</strong><small>Ongoing calls with issues</small></button>
     <button data-filter="failed" aria-pressed="false"><span class="metric-label">Failed calls <span aria-hidden="true">↗</span></span><strong id="failed">—</strong><small>In recent history</small></button>
   </section>
+  <section class="panel spend-panel" aria-labelledby="spend-heading">
+    <div class="panel-heading"><h2 id="spend-heading">Estimated Gemini audio spend</h2><strong id="spend-total">—</strong></div>
+    <div class="spend-body"><p id="spend-breakdown">Waiting for usage data…</p><p id="spend-coverage" class="muted"></p>
+    <p class="detail-note">Both translation directions · all tracked calls, independent of filters. Audio-duration estimate, not Google’s billed total. Excludes hosting, telephony, taxes and other API charges. Resets on server restart.</p>
+    <p class="detail-note">Live Translate rates: $0.00525/input minute + $0.0315/output minute, checked Oct 9, 2026. <a href="https://ai.google.dev/gemini-api/docs/pricing#gemini-3.5-live-translate" target="_blank" rel="noopener noreferrer">Google pricing</a></p></div>
+  </section>
   <div id="workspace" class="workspace">
     <section class="panel calls-panel">
       <div class="panel-heading"><div class="heading-group"><h2>Calls</h2><span id="count" class="count muted">Loading…</span></div><span class="muted">Select a call to inspect →</span></div>

@@ -504,3 +504,19 @@ the model's input rate + received output minutes × its output rate. These are
 estimates, not invoices; pricing, context billing, credits, taxes, transcription,
 and other services must be reconciled separately. Pricing reference:
 https://ai.google.dev/gemini-api/docs/pricing
+
+The `/monitor` dashboard also displays a combined **Estimated Gemini audio spend**
+widget and per-call Health usage details. Estimates currently price only
+`gemini-3.5-live-translate-preview` at $0.00525/input minute and $0.0315/output
+minute (rates checked 2026-10-09). Unknown models are unpriced, missing measurements
+are flagged, and missing token reports show “Not reported”. Token counts shown are
+the latest report, not an accumulated bill. The estimate uses audio durations even
+when token metadata is absent. Hosting, telephony, taxes and other API charges are
+excluded. Rates should be reviewed when pricing changes.
+
+The dashboard total covers all tracked translation calls **since this server
+process started**, regardless of table filters. Completed-call totals survive
+history pruning, but all totals reset on process restart/redeploy. This is not an
+account-wide or historical billing ledger. Export server logs before redeploying
+for reconciliation across runs; individual call exports include model, audio
+minutes, latest token total, and combined estimated cost.

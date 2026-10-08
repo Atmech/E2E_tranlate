@@ -178,3 +178,35 @@ test('recovery telemetry triggers attention and exposes bounded counters without
   state = 'catching_up'; snapshot = monitor.snapshot(); assert.equal(snapshot.counts.attention, 1);
   state = 'ready'; queue = 0; snapshot = monitor.snapshot(); assert.equal(snapshot.counts.attention, 0);
 });
+
+test('cost widget totals both directions without double counting and survives history pruning', () => {
+  let now = 100;
+  const monitor = new CallMonitor({ now: () => now, historyLimit: 0 });
+  const id = monitor.start('cost-call');
+  const measured = { model: 'gemini-3.5-live-translate-preview', inputSubmittedMs: 60000,
+    outputReceivedMs: 60000, usageReports: 1 };
+  monitor.watch(id, () => ({caller:{cost:measured},agent:{cost:measured}}));
+  const first=monitor.snapshot();
+  assert.ok(Math.abs(first.cost.estimatedUsd - 0.0735) < 1e-9);
+  assert.equal(first.cost.calls,1); assert.equal(first.cost.pricedDirections,2);
+  assert.deepEqual(monitor.snapshot().cost,first.cost);
+  now=200;monitor.end(id);monitor.end(id);
+  const ended=monitor.snapshot();assert.equal(ended.calls.length,0);
+  assert.equal(ended.cost.estimatedUsd,first.cost.estimatedUsd);
+  assert.equal(ended.cost.activeUsd,0);assert.equal(ended.cost.completedUsd,first.cost.estimatedUsd);
+  assert.equal(ended.cost.calls,1);
+  const another=monitor.start('cost-call');monitor.watch(another,()=>({caller:{cost:measured},agent:{cost:measured}}));
+  assert.equal(monitor.snapshot().cost.calls,2);
+  assert.equal(monitor.snapshot().cost.estimatedUsd,2*first.cost.estimatedUsd);
+});
+
+test('cost coverage distinguishes missing data and unknown model from zero-priced usage', () => {
+  const monitor=new CallMonitor();const id=monitor.start('partial');
+  monitor.leg(id,'caller',{cost:{model:'unknown',inputSubmittedMs:60000,outputReceivedMs:0,usageReports:0}});
+  const snapshot=monitor.snapshot();
+  assert.equal(snapshot.cost.pricedDirections,0);assert.equal(snapshot.cost.unpricedDirections,1);
+  assert.equal(snapshot.cost.missingDirections,1);assert.equal(snapshot.cost.usageReports,0);
+  assert.equal(snapshot.cost.inputMinutes,1);
+  monitor.start('loop','loopback');assert.equal(monitor.snapshot().cost.calls,1);
+  assert.equal(new CallMonitor().snapshot().cost.calls,0);
+});
