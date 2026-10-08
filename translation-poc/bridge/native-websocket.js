@@ -32,7 +32,7 @@ function errorInfo(error) {
 }
 
 export function handleNativeConnection(ws, { activeCalls, agents = new Set(), createBridge,
-  mode = MODE, createTranslator, setupTimeoutMs, monitor }) {
+  mode = MODE, createTranslator, setupTimeoutMs, monitor, maxCalls = Infinity }) {
   let bridge, callId, mediaRole, pacer, paused = false, ended = false;
 
   const connectedAt = Date.now();
@@ -138,6 +138,11 @@ export function handleNativeConnection(ws, { activeCalls, agents = new Set(), cr
       ws.send(pcm, { binary: true });
     },
 
+    flushPlayback() {
+      if (ws.readyState !== 1 || ended) return;
+      ws.send(JSON.stringify({ command: 'FLUSH_MEDIA' }));
+      paused = false; pacer?.resetClock(); bridge?.onPause?.(false);
+    },
     end(code = 1000, reason) {
       if (ended) return;
       markLocalClose('sock.end', code, reason);
@@ -277,6 +282,7 @@ export function handleNativeConnection(ws, { activeCalls, agents = new Set(), cr
             return fail('CALL_ID collision');
 
           if (!session) {
+            if (activeCalls.size >= maxCalls) return fail('Call capacity reached');
             // Each CALL_ID owns an independent caller/agent pair and translators.
             session = new CallTranslationSession(metadata.callId, {
               createTranslator,

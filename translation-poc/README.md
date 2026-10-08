@@ -18,7 +18,7 @@ agent and no `relay.js`. Audio is raw signed 16-bit little-endian mono PCM at 8k
 
 ```bash
 cp .env.example .env       # fill in GEMINI_API_KEY; do not overwrite an existing .env
-npm install
+npm ci --ignore-scripts
 npm start
 ```
 
@@ -108,15 +108,16 @@ is complete before testing. Restarting the process ends active calls.
    with different `CALL_ID`s: verify each participant hears only their own peer's
    translation, then end one call and confirm the other continues in both directions.
 
-The `/media` endpoint remains unauthenticated in this POC. Call IDs identify sessions;
-they are not credentials. Production authentication and multi-instance routing are
-outside this change.
+The `/media` endpoint retains its existing unauthenticated connection contract.
+Call-ingress authentication is deferred to a coordinated release; call IDs are not
+credentials. Multi-instance routing remains unsupported.
 
 ## Automated checks
 
 ```bash
 npm test                    # offline regressions; fake translators, no network/API key
 npm run test:media-ws        # real localhost WebSockets, fake translator; no Asterisk/Gemini
+npm run test:ws-hardening    # real bridge: malformed traffic cannot crash healthy connections
 npm run test:monitor-http    # real localhost HTTP: auth, SSE, logout and session expiry
 npm run smoke:asterisk-ws    # existing real Asterisk single-connection transport smoke
 ```
@@ -127,6 +128,13 @@ They also cover monitor authentication, rate limits, sanitized failure causes,
 bounded history and native-call telemetry.
 The localhost test negotiates `media` and exchanges real WebSocket frames through
 the native handler. Its deterministic fake model verifies routing, not language quality.
+
+WebSocket messages are limited to 64 KiB for `/agent`, 128 KiB for the legacy
+`/audiosocket` relay, and 65,500 bytes for `/media`. Limits apply to the complete
+message, including fragmented messages. Oversized messages close that connection.
+The hardening check starts isolated bridge processes with a dummy API key and
+loopback media; it sends invalid upgrade URLs, invalid protocol frames, and oversized
+messages while checking that an existing media connection continues passing audio.
 
 For `smoke:asterisk-ws`, start the Docker setup in `asterisk/` and stop `npm start`
 first: the script owns port 8080. It makes two sequential calls through `5000@demo`,
@@ -217,18 +225,17 @@ accepts only loopback client connections. It does not enable HTTP access over LA
   categories, recognized speech text and translated text. Speech text is fetched
   only for the selected call through an authenticated endpoint; it is not sent
   to every live viewer in the all-calls stream. Audio, raw provider errors and
-  credentials are not captured. Existing server console logging is unchanged.
+  credentials are not captured. Console transcript logging is disabled by default (`LOG_TRANSCRIPTS=false`).
 - Audio activity may be silence. Status does not prove translation quality or
   audio delivery at the far endpoint. A lost live stream marks the page as stale.
-  Legacy translator errors are reported without adding automatic call termination.
+  Terminal legacy translator errors end the call and release resources.
 - Select a call and choose **Export .txt** to download its current status, direction
   details, counters, event timeline, retained issues, recognized speech and
   translations. The export excludes audio and cannot include history already lost
   to a restart or retention limit. Treat downloaded files as sensitive call data.
 
-Monitor authentication protects `/monitor` and its subroutes. The existing
-`/media`, `/agent`, `/audiosocket`, TCP AudioSocket and legacy browser demo retain
-their existing access behavior; call-ingress authentication is a separate change.
+Monitor authentication protects `/monitor` and its subroutes. Native media, legacy
+browser and AudioSocket endpoints retain their existing access behavior.
 
 ## Legacy browser demo
 
@@ -284,8 +291,11 @@ error/close, or a synchronous send failure. This follows Google's
 [Live API session management](https://ai.google.dev/gemini-api/docs/live-api/session-management).
 No environment-variable changes are required.
 
-Every connection must receive `setupComplete` within five seconds before audio
-is sent. Recovery closes the previous SDK session before opening a replacement;
+Initial setup must receive `setupComplete` within five seconds before audio
+is sent. Recovery shares a deadline across all attempts, reserving 250ms of headroom
+below the smaller audio-byte or message-count buffer budget. Each attempt gets its
+share of the remaining deadline, capped by `GEMINI_CONNECT_TIMEOUT_MS`, so fresh
+fallback is attempted before continuous input fills the buffer. Recovery closes the previous SDK session before opening a replacement;
 callbacks from replaced sockets are ignored. It tries resumption up to three
 times, then one fresh session. The fresh fallback logs a warning because it resets
 translation context. Exhausted recovery or buffer overflow reports terminal
@@ -305,7 +315,7 @@ Logs include call ID, direction, reconnect count, queue high-water marks, and
 backlog-drained events. Fatal errors record queue state before cleanup, and
 transport errors retain available error/status and WebSocket close codes.
 `Translator.getStats()` exposes recovery and queue counters for consumers; these
-counters are not yet displayed in the monitor UI. `catchupMs` includes time spent
+counters are displayed in the monitor Health tab and exports. `catchupMs` includes time spent
 waiting for reconnection, and `maxQueuedMs` is the lifetime high-water mark.
 
 Optional recovery settings (defaults require no `.env` changes):
@@ -390,3 +400,58 @@ Diagnostics (no audio content):
 Run offline regression tests with `npm test` (no Gemini calls). For the demo, test
 short replies, long sentences, PTT release mid-batch, hangup during speech, and two
 consecutive calls without refreshing. Compare the same phrases in both directions.
+
+## Connection compatibility and optional limits
+
+This release requires no changes to the existing Asterisk connection configuration.
+The `/media` URL, `media` subprotocol, JSON `MEDIA_START`, four pairing fields
+(`CALL_ID`, `ROLE`, `SOURCE_LANG`, `TARGET_LANG`), and `slin` 8kHz mono PCM with
+320-byte 20ms frames remain the same. No new credentials, tokens, or proxy settings
+are required. Native, browser-agent, relay, and TCP AudioSocket endpoints remain
+available, with the original bind behavior. Legacy browsers remain connected across
+sequential calls.
+
+Authentication and default heartbeat enforcement are deferred. Optional backend
+limits `MAX_ACTIVE_CALLS`, `MAX_MEDIA_CONNECTIONS`, `MAX_UPGRADES_PER_MINUTE`,
+and `WS_HEARTBEAT_MS` default to **0 (disabled)**. No new admission cap or pong
+requirement is imposed unless the backend operator explicitly enables one. Measure
+capacity and confirm the existing client's pong behavior before enabling them.
+When limits are enabled, sockets waiting for metadata count toward the connection
+cap, rate limits apply globally to upgrades, and existing calls can acquire their
+missing peer at the call-count cap (subject to the socket cap). Disconnected sockets
+release their slots. Playback and transport buffer bounds still protect the process.
+
+## Audio and readiness checks
+
+General Live models use `NO_INTERRUPTION` so continued source speech does not cut
+off the interpreter's current translation. Explicit provider interruption events
+clear the destination playback queue and filter state; native Asterisk receives
+`FLUSH_MEDIA`, and browser playback is cancelled. Legacy TCP cannot retract audio
+already submitted to Asterisk. Each translation direction owns a stateful 63-tap
+low-pass downsampler, retaining history and phase across chunks (~1.3ms filter delay
+at 24kHz). Speech-band gain, alias rejection, sample counts, and irregular chunks
+are covered by regression tests.
+
+The monitor shows reconnecting, catching-up, ready and failed states, input backlog
+and its peak, reconnect counts, and context resets. Speech text stays within the
+authenticated transcript endpoint; console transcript logging is opt-in.
+
+```bash
+npm test
+npm run test:integration
+npm audit --omit=dev
+npm run smoke   # real provider: production config, setup acceptance, synthetic silence
+```
+
+CI runs offline regressions, real localhost media/HTTP/crash checks, and the
+dependency audit on Node 22 with `npm ci`. The real-provider smoke is manual and
+uses the actual Translator configuration; it fails on rejected setup, timeout,
+or premature closure and always closes its session. The SDK is pinned to the
+tested version in package.json; the lockfile pins transitive dependencies.
+
+Production acceptance still requires five concurrent 30-minute paired phone calls
+on the actual Asterisk routing and configured model, with speech through rotations,
+flow-control pauses, and hangup during recovery. Record heard latency, gaps,
+missing/repeated words, cross-call isolation, backlog drainage and resource
+cleanup against agreed thresholds. Local fake-model tests and synthetic silence
+are not evidence of phone audio quality or long-call capacity.

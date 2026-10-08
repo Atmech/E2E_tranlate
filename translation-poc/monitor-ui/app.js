@@ -21,7 +21,7 @@ const node = (tag, text, className) => {
 const time = value => value ? new Date(value).toLocaleTimeString() : '—';
 const duration = ms => `${Math.floor(ms / 60000)}m ${Math.floor(ms / 1000) % 60}s`;
 const badge = (text, type) => node('span', text, `badge ${type}`);
-const hasIssues = call => call.issueCount > 0 || Object.values(call.legs).some(l => l.paused || l.queueMs >= 3000);
+const hasIssues = call => call.issueCount > 0 || Object.values(call.legs).some(l => l.paused || l.queueMs >= 3000 || ['recovering', 'catching_up', 'failed'].includes(l.translator));
 const age = at => at ? `${Math.max(0, Math.floor((snapshot.at - at) / 1000))}s ago` : 'No activity yet';
 const setText = (el, text) => { if (el.textContent !== String(text)) el.textContent = text; };
 
@@ -117,6 +117,8 @@ async function exportCall(call) {
       `Languages: ${leg.sourceLang || '—'} → ${leg.targetLang || '—'}`,
       `Connection: ${leg.connected ? 'Connected' : 'Disconnected'}`,
       `Translator: ${leg.translator || '—'}`,
+      `Reconnects: ${leg.reconnectCount ?? 0}; context resets: ${leg.freshFallbackCount ?? 0}`,
+      `Input backlog: ${leg.inputQueueMs ?? 0} ms; peak: ${leg.maxInputQueueMs ?? 0} ms`,
       `Translator setup: ${leg.setupMs == null ? '—' : `${leg.setupMs} ms`}`,
       `Incoming audio: ${((leg.receivedBytes || 0) / 1024).toFixed(1)} KiB`,
       `Last incoming audio: ${iso(leg.lastInputAt)}`,
@@ -241,7 +243,11 @@ function renderDetail() {
       for (const [label, value] of [
         ['Languages', `${language(leg.sourceLang)} → ${language(leg.targetLang)}`],
         ['Connection', leg.connected ? 'Connected' : 'Disconnected'],
-        ['Translator', leg.translator || '—'],
+        ['Translator', ({ catching_up: 'Catching up', recovering: 'Reconnecting', connecting: 'Connecting', ready: 'Ready', failed: 'Failed', closed: 'Closed' })[leg.translator] || leg.translator || '—'],
+        ['Reconnects', leg.reconnectCount ?? 0],
+        ['Context resets', leg.freshFallbackCount ?? 0],
+        ['Input backlog', `${leg.inputQueueMs ?? 0} ms · peak ${leg.maxInputQueueMs ?? 0} ms`],
+        ['Current recovery', `${leg.recoveryMs ?? 0} ms`],
         ['Setup time', leg.setupMs == null ? '—' : `${leg.setupMs} ms`],
         ['Last incoming audio', age(leg.lastInputAt)],
         ['Last translated output', age(leg.lastOutputAt)],

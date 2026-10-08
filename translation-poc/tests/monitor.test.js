@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
-import { CallMonitor, failureCause } from '../bridge/CallMonitor.js';
+import { CallMonitor, failureCause, translatorTelemetry } from '../bridge/CallMonitor.js';
 import { MonitorAuth, passwordHash } from '../bridge/monitor-auth.js';
 import { handleNativeConnection } from '../bridge/native-websocket.js';
 
@@ -160,4 +160,21 @@ test('native telemetry retains speech text privately alongside failures and dire
   assert.ok(!JSON.stringify(monitor.snapshot()).includes('secret'));
   assert.equal(call.legs.agent.connected, false);
   assert.equal(call.legs.agent.queueMs, 4000, 'capture queue before cleanup clears it');
+});
+
+
+test('recovery telemetry triggers attention and exposes bounded counters without provider details', () => {
+  const monitor = new CallMonitor(); const id = monitor.start('recovering-call');
+  let state = 'recovering', queue = 600;
+  const translator = { getStats: () => ({ state, outboxMs: queue, maxOutboxMs: 2000,
+    reconnectCount: 2, freshFallbackCount: 1, recoveryMs: 900, secret: 'must-not-leak' }) };
+  monitor.update(id, { state: 'ready' });
+  monitor.watch(id, () => ({ caller: translatorTelemetry(translator) }));
+  let snapshot = monitor.snapshot();
+  assert.equal(snapshot.counts.attention, 1);
+  assert.equal(snapshot.calls[0].legs.caller.translator, 'recovering');
+  assert.equal(snapshot.calls[0].legs.caller.inputQueueMs, 600);
+  assert.ok(!JSON.stringify(snapshot).includes('must-not-leak'));
+  state = 'catching_up'; snapshot = monitor.snapshot(); assert.equal(snapshot.counts.attention, 1);
+  state = 'ready'; queue = 0; snapshot = monitor.snapshot(); assert.equal(snapshot.counts.attention, 0);
 });

@@ -227,6 +227,11 @@ export class OutputPacer {
     this.backlogWarningActive = false;
   }
   _write(frame) {
+    if ((this.sock?.writableLength || this.sock?.bufferedAmount || 0) > 16000 * 5) {
+      if (this.onFailure) this.onFailure('Playback transport buffer exceeded five seconds');
+      else this.stop();
+      return;
+    }
     if (this.sock && !this.sock.destroyed && this.sock.writable)
       this.sock.write(this.encodeFrame(frame));
   }
