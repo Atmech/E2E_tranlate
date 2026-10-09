@@ -335,6 +335,42 @@ are available in translator stats and fatal/backlog-drained logs.
 Existing environment overrides take precedence: remove or update old chunk-size
 and reconnect-limit overrides when testing these defaults.
 
+### Test-only speech gate
+
+The gate is **off by default**. Enable it only in an isolated synthetic load-test
+instance, never one serving real user calls: quiet speech below the peak threshold
+can be discarded. Existing reconnect, burst catch-up, and cost accounting stay active.
+
+```dotenv
+LOAD_TEST_SPEECH_GATE=true
+LOAD_TEST_SPEECH_GATE_THRESHOLD=128
+LOAD_TEST_SPEECH_GATE_HANGOVER_MS=600
+LOAD_TEST_SPEECH_GATE_LOG_INTERVAL_MS=60000
+```
+
+At 16kHz, an incoming frame with any sample magnitude at least 128 opens the gate.
+It forwards subsequent silence for 600ms (rounded up to an incoming frame boundary),
+then skips silent frames before they enter pending/reconnect queues. A remaining
+partial Gemini chunk is flushed on the first skipped frame, preserving audio order.
+The gate leaves the session connected and does not call `endInput()` or inject the
+PTT synthetic tail at each silent gap. Explicit PTT release retains its existing
+behavior. Threshold accepts integer 0–32767; hangover accepts 0–5000ms; log interval
+accepts 1000–3600000ms. Threshold 0 forwards all frames.
+
+Startup, periodic, and final logs identify the enabled test gate. Translator stats
+include `speechGateInputMs`, `speechForwardedMs`, `silenceSkippedMs`, frame counts,
+and forwarding/saving ratios. **Forwarded means admitted by the gate, not accepted
+by Gemini or billed.** Existing cost counters separately track received audio,
+SDK-accepted audio (including queued replay), and synthetic silence. The gate's
+saved percentage describes source audio volume, not invoice savings.
+
+First run 2 calls for 2 minutes with the low-speech WAVs. Check both translation
+directions, quiet onsets/final words, skipped audio, submitted-audio counters, and
+absence of translator failures. If final words are clipped, test a 1000ms hangover.
+Then repeat 15 calls for 10 minutes to exercise session rotation. This reduced-audio
+workload does not establish continuous-audio CPU capacity. Remove the flag or set
+`LOAD_TEST_SPEECH_GATE=false` and restart to restore normal input forwarding.
+
 Optional recovery settings (defaults require no `.env` changes):
 
 | Variable | Default | Purpose |

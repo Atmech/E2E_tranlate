@@ -19,6 +19,28 @@ if (!Number.isInteger(CHUNK_SAMPLES) || CHUNK_SAMPLES < 1 || CHUNK_SAMPLES > 160
   throw new Error('GEMINI_CHUNK_SAMPLES must be an integer between 1 and 16000');
 }
 
+// TEST-ONLY cost control. When enabled, long near-silent sections of synthetic load-test
+// WAVs are discarded locally instead of being submitted to Gemini. The Gemini Live
+// session itself remains connected, so concurrent-session / GoAway / resumption testing
+// still exercises the real service. Keep this OFF for production/user calls.
+const LOAD_TEST_SPEECH_GATE = /^(1|true|yes|on)$/i.test(
+  String(process.env.LOAD_TEST_SPEECH_GATE || ''),
+);
+const SPEECH_GATE_THRESHOLD = Number(process.env.LOAD_TEST_SPEECH_GATE_THRESHOLD || 128);
+const SPEECH_GATE_HANGOVER_MS = Number(process.env.LOAD_TEST_SPEECH_GATE_HANGOVER_MS || 600);
+const SPEECH_GATE_LOG_INTERVAL_MS = Number(process.env.LOAD_TEST_SPEECH_GATE_LOG_INTERVAL_MS || 60000);
+
+if (!Number.isInteger(SPEECH_GATE_THRESHOLD) || SPEECH_GATE_THRESHOLD < 0 || SPEECH_GATE_THRESHOLD > 32767) {
+  throw new Error('LOAD_TEST_SPEECH_GATE_THRESHOLD must be an integer between 0 and 32767');
+}
+if (!Number.isFinite(SPEECH_GATE_HANGOVER_MS) || SPEECH_GATE_HANGOVER_MS < 0 || SPEECH_GATE_HANGOVER_MS > 5000) {
+  throw new Error('LOAD_TEST_SPEECH_GATE_HANGOVER_MS must be between 0 and 5000');
+}
+if (!Number.isFinite(SPEECH_GATE_LOG_INTERVAL_MS) || SPEECH_GATE_LOG_INTERVAL_MS < 1000 || SPEECH_GATE_LOG_INTERVAL_MS > 3600000) {
+  throw new Error('LOAD_TEST_SPEECH_GATE_LOG_INTERVAL_MS must be between 1000 and 3600000');
+}
+const SPEECH_GATE_HANGOVER_SAMPLES = Math.round(16000 * SPEECH_GATE_HANGOVER_MS / 1000);
+
 // 16kHz * 2 bytes/sample = 32 bytes/ms.
 const INPUT_BYTES_PER_MS = 32;
 
@@ -214,6 +236,14 @@ export class Translator {
     this.drainBursts = 0;
     this.maxDrainBurstMessages = 0;
     this.maxDrainBurstMs = 0;
+    // Test-only speech gate accounting. Counters are based on 16kHz source samples.
+    this.speechGateHangoverSamples = 0;
+    this.speechGateInputSamples = 0;
+    this.speechGateForwardedSamples = 0;
+    this.speechGateSkippedSamples = 0;
+    this.speechGateSpeechFrames = 0;
+    this.speechGateSilentFrames = 0;
+    this.speechGateLastLogAt = performance.now();
   }
 
   _setState(state, details = {}) {
@@ -260,6 +290,89 @@ export class Translator {
     return Math.max(MIN_DRAIN_DELAY_MS, audioDurationMs / factor);
   }
 
+  _speechGateStats() {
+    const inputMs = this.speechGateInputSamples / 16;
+    const forwardedMs = this.speechGateForwardedSamples / 16;
+    const skippedMs = this.speechGateSkippedSamples / 16;
+    const ratio = this.speechGateInputSamples > 0
+      ? this.speechGateForwardedSamples / this.speechGateInputSamples
+      : (LOAD_TEST_SPEECH_GATE ? 0 : 1);
+    const savedPercent = LOAD_TEST_SPEECH_GATE && this.speechGateInputSamples > 0
+      ? (1 - ratio) * 100
+      : 0;
+
+    return {
+      speechGateEnabled: LOAD_TEST_SPEECH_GATE,
+      speechGateThreshold: SPEECH_GATE_THRESHOLD,
+      speechGateHangoverMs: SPEECH_GATE_HANGOVER_MS,
+      speechGateInputMs: Math.round(inputMs),
+      speechForwardedMs: Math.round(forwardedMs),
+      silenceSkippedMs: Math.round(skippedMs),
+      speechGateRatio: Number(ratio.toFixed(4)),
+      speechGateSavedPercent: Number(savedPercent.toFixed(1)),
+      speechGateSpeechFrames: this.speechGateSpeechFrames,
+      speechGateSilentFrames: this.speechGateSilentFrames,
+    };
+  }
+
+  _logSpeechGate(prefix = 'speech-gate') {
+    if (!LOAD_TEST_SPEECH_GATE) return;
+    const stats = this._speechGateStats();
+    console.log(
+      `${this._tag()} ${prefix} ` +
+      `inputMs=${stats.speechGateInputMs} ` +
+      `forwardedMs=${stats.speechForwardedMs} ` +
+      `skippedMs=${stats.silenceSkippedMs} ` +
+      `forwardedRatio=${stats.speechGateRatio} ` +
+      `saved=${stats.speechGateSavedPercent}%`,
+    );
+  }
+
+  _speechGateAllows(int16_16k) {
+    if (!LOAD_TEST_SPEECH_GATE) return true;
+
+    this.speechGateInputSamples += int16_16k.length;
+
+    // Peak detector is intentional for synthetic load-test WAVs: their silent regions are
+    // digital/near-digital silence, so this is cheap and avoids clipping speech onsets.
+    let peak = 0;
+    for (let i = 0; i < int16_16k.length; i++) {
+      const value = int16_16k[i];
+      const abs = value < 0 ? -value : value;
+      if (abs > peak) peak = abs;
+      if (peak >= SPEECH_GATE_THRESHOLD) break;
+    }
+
+    let forward = false;
+
+    if (peak >= SPEECH_GATE_THRESHOLD) {
+      this.speechGateSpeechFrames += 1;
+      this.speechGateHangoverSamples = SPEECH_GATE_HANGOVER_SAMPLES;
+      forward = true;
+    } else {
+      this.speechGateSilentFrames += 1;
+      if (this.speechGateHangoverSamples > 0) {
+        // Forward a short tail of real silence so Gemini can finish the utterance/turn.
+        this.speechGateHangoverSamples = Math.max(
+          0,
+          this.speechGateHangoverSamples - int16_16k.length,
+        );
+        forward = true;
+      }
+    }
+
+    if (forward) this.speechGateForwardedSamples += int16_16k.length;
+    else this.speechGateSkippedSamples += int16_16k.length;
+
+    const now = performance.now();
+    if (now - this.speechGateLastLogAt >= SPEECH_GATE_LOG_INTERVAL_MS) {
+      this.speechGateLastLogAt = now;
+      this._logSpeechGate();
+    }
+
+    return forward;
+  }
+
   _config(handle = null) {
     const isTranslate = MODEL.includes('translate');
     const config = {
@@ -294,6 +407,14 @@ export class Translator {
     this.costStartedAt = performance.now();
     this._logCost('start');
     this._setState('connecting');
+
+    if (LOAD_TEST_SPEECH_GATE) {
+      console.warn(
+        `${this._tag()} TEST speech gate ENABLED ` +
+        `threshold=${SPEECH_GATE_THRESHOLD} hangoverMs=${SPEECH_GATE_HANGOVER_MS}; ` +
+        'do not use this setting for production/user calls',
+      );
+    }
 
     if (!API_KEY) {
       const error = new Error('GEMINI_API_KEY is not set');
@@ -829,6 +950,12 @@ export class Translator {
 
     this.costInputMs += int16_16k.length / 16;
     if (performance.now() - this.costLastLogAt >= 60000) this._logCost('sample');
+    // Count received audio above even when the test gate skips it. Submitted cost
+    // remains counted only after the SDK accepts a send.
+    if (!this._speechGateAllows(int16_16k)) {
+      this._flushPendingInput();
+      return;
+    }
     this.beginInput();
     this.inputOpen = true;
 
@@ -873,11 +1000,9 @@ export class Translator {
     this.inputTailTimer = null;
   }
 
-  endInput() {
-    if (this.closed || !this.inputOpen) return;
-
-    this.inputOpen = false;
-
+  // Also used when the test gate closes, so a partial chunk cannot wait for
+  // the next utterance. Do not start the PTT synthetic tail on every silent gap.
+  _flushPendingInput() {
     if (this.pending.length) {
       this._send({
         audio: {
@@ -888,6 +1013,14 @@ export class Translator {
 
       this.pending = new Int16Array(0);
     }
+  }
+
+  endInput() {
+    if (this.closed || !this.inputOpen) return;
+
+    this.inputOpen = false;
+
+    this._flushPendingInput();
 
     if (this.closed) return;
 
@@ -980,12 +1113,14 @@ export class Translator {
       drainBursts: this.drainBursts,
       maxDrainBurstMessages: this.maxDrainBurstMessages,
       maxDrainBurstMs: Math.round(this.maxDrainBurstMs),
+      ...this._speechGateStats(),
     };
   }
 
   close() {
     if (this.closed) return;
 
+    this._logSpeechGate('speech-gate final');
     if (this.started) this._logCost('end');
     this.closed = true;
     this.cancelRecoveryWait?.();

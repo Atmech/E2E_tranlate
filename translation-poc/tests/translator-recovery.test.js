@@ -469,3 +469,80 @@ test('burst configuration rejects invalid targets and message limits', () => {
   for (const value of ['0', '65', '1.5', 'NaN'])
     assert.throws(() => harness({ GEMINI_CATCHUP_BURST_MAX_MESSAGES: value }), /must/);
 });
+
+const gatedDefaults = { ...burstDefaults, LOAD_TEST_SPEECH_GATE: 'true' };
+
+test('speech gate is opt-in and silent production input is still submitted', async () => {
+  for (const flag of [undefined, 'false']) {
+    const h = harness({ ...burstDefaults, LOAD_TEST_SPEECH_GATE: flag }); await h.start();
+    h.t.feed(pcm40(0));
+    assert.equal(h.calls[0].sent.length, 1);
+    assert.equal(h.t.getStats().speechGateEnabled, false);
+    assert.equal(h.t.getStats().cost.inputSubmittedMs, 40); h.t.close();
+  }
+});
+
+test('speech gate drops initial silence and flushes the partial chunk after its hangover', async () => {
+  const h = harness(gatedDefaults); await h.start();
+  for (let i = 0; i < 50; i++) h.t.feed(pcm(0));
+  assert.equal(h.calls[0].sent.length, 0); assert.equal(h.t.pending.length, 0);
+  h.t.feed(pcm(1000));
+  for (let i = 0; i < 300; i++) h.t.feed(pcm(0));
+  const stats = h.t.getStats();
+  assert.equal(stats.speechGateInputMs, 7020);
+  assert.equal(stats.speechForwardedMs, 620);
+  assert.equal(stats.silenceSkippedMs, 6400);
+  assert.equal(stats.cost.inputSubmittedMs, 620);
+  assert.equal(h.t.costInputMs, 7020);
+  assert.equal(h.t.pending.length, 0); assert.equal(h.t.inputTailTimer, null);
+  const submitted = Buffer.concat(h.calls[0].sent.map(x => Buffer.from(x.payload.audio.data, 'base64')));
+  assert.deepEqual(submitted, Buffer.concat([Buffer.from(pcm(1000).buffer), Buffer.alloc(19200)]));
+  h.t.feed(pcm40(2000));
+  assert.equal(samples(h.calls[0]).at(-1), 2000);
+  h.t.close(); h.t.close();
+  assert.equal(h.logs.filter(x => String(x[0]).includes('speech-gate final')).length, 1);
+});
+
+test('gated speech and pending tail survive rotation and a send failure without double counting', async () => {
+  const h = harness(gatedDefaults); await h.start(); await h.rotate();
+  h.t.feed(pcm(1000));
+  for (let i = 0; i < 100; i++) h.t.feed(pcm(0));
+  assert.equal(h.t.getStats().outboxMs, 620);
+  assert.equal(h.t.pending.length, 0);
+  h.calls[1].failAfter = 2; await h.ready(1); await h.ready(); await h.tick(2000);
+  const submitted = [...h.calls[1].sent, ...h.calls[2].sent];
+  assert.equal(submitted.reduce((n, x) => n + Buffer.from(x.payload.audio.data, 'base64').length / 32, 0), 620);
+  assert.equal(h.t.getStats().cost.inputSubmittedMs, 620);
+  assert.equal(h.t.getStats().outboxMs, 0); assert.equal(h.failures.length, 0);
+  h.t.close(); assert.equal(h.timers.size, 0);
+});
+
+test('speech gate thresholds and hangover overrides handle quiet and negative samples', async () => {
+  const h = harness({ ...gatedDefaults, LOAD_TEST_SPEECH_GATE_HANGOVER_MS: '0' }); await h.start();
+  h.t.feed(pcm40(127)); assert.equal(h.calls[0].sent.length, 0);
+  h.t.feed(pcm40(-128)); assert.equal(h.calls[0].sent.length, 1);
+  h.t.feed(pcm40(0)); assert.equal(h.calls[0].sent.length, 1);
+  h.t.feed(pcm40(-32768)); assert.equal(h.calls[0].sent.length, 2);
+  h.t.close();
+});
+
+test('gate summaries do not claim PTT synthetic silence as source audio savings', async () => {
+  const h = harness(gatedDefaults); await h.start(); h.t.feed(pcm40(1000)); h.t.endInput();
+  await h.tick(2000);
+  assert.equal(h.t.getStats().speechForwardedMs, 40);
+  assert.equal(h.t.getStats().cost.inputSubmittedMs, 2040);
+  assert.equal(h.t.getStats().cost.syntheticInputSubmittedMs, 2000);
+  assert.equal(h.calls[0].sent.at(-1).payload.audioStreamEnd, true); h.t.close();
+});
+
+test('gate settings reject invalid values and periodic summaries are bounded', async () => {
+  for (const env of [
+    { LOAD_TEST_SPEECH_GATE_THRESHOLD: '-1' }, { LOAD_TEST_SPEECH_GATE_THRESHOLD: '32768' },
+    { LOAD_TEST_SPEECH_GATE_HANGOVER_MS: 'NaN' }, { LOAD_TEST_SPEECH_GATE_HANGOVER_MS: '5001' },
+    { LOAD_TEST_SPEECH_GATE_LOG_INTERVAL_MS: '999' },
+  ]) assert.throws(() => harness(env), /must/);
+  const h = harness({ ...gatedDefaults, LOAD_TEST_SPEECH_GATE_LOG_INTERVAL_MS: '1000' }); await h.start();
+  h.t.feed(pcm40(0)); await h.tick(1000); h.t.feed(pcm40(0)); h.t.feed(pcm40(0));
+  assert.equal(h.logs.filter(x => String(x[0]).includes('speech-gate inputMs=')).length, 1);
+  h.t.close();
+});
