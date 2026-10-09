@@ -309,12 +309,15 @@ times, then one fresh session without an additional backoff. The fresh fallback 
 translation context. Exhausted recovery or buffer overflow reports terminal
 failure through the existing call teardown path.
 
-During recovery, telephone media continues and the translator buffers up to ten
-seconds of PCM per direction (320,000 bytes), with a separate 1,000-message bound.
+During recovery, telephone media continues and the translator buffers up to thirty
+seconds of PCM per direction (960,000 bytes), with a separate 3,000-message bound.
 Buffered speech drains in order faster than real time while new speech joins
 behind it: 1.5x below 500ms queued, 2x from 500ms, and 4x from 2000ms. These
 rates describe local send pacing; event-loop delays can reduce actual throughput.
-Once the queue empties, live input returns immediately to direct sending.
+Catch-up sends bounded bursts targeting 160ms of audio, capped at eight messages
+per callback (normally four 40ms chunks), then paces the entire burst at the
+applicable catch-up factor. Once the queue empties, live input returns immediately
+to direct sending.
 Synthetic PTT release silence pauses until that backlog drains, then continues
 in real time. Speech already sent to a lost connection is not replayed locally,
 so recovery does not guarantee lossless or duplicate-free audio at the handoff.
@@ -326,12 +329,18 @@ transport errors retain available error/status and WebSocket close codes.
 counters are displayed in the monitor Health tab and exports. `catchupMs` includes time spent
 waiting for reconnection, and `maxQueuedMs` is the lifetime high-water mark.
 
+Burst diagnostics (`drainBursts`, `maxDrainBurstMessages`, `maxDrainBurstMs`)
+are available in translator stats and fatal/backlog-drained logs.
+
+Existing environment overrides take precedence: remove or update old chunk-size
+and reconnect-limit overrides when testing these defaults.
+
 Optional recovery settings (defaults require no `.env` changes):
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `GEMINI_RECONNECT_BUFFER_SECONDS` | `10` | Queued PCM limit, 1–60 seconds |
-| `GEMINI_RECONNECT_MAX_MESSAGES` | `1000` | Queue message limit, 100–10000 |
+| `GEMINI_RECONNECT_BUFFER_SECONDS` | `30` | Queued PCM limit, 1–60 seconds |
+| `GEMINI_RECONNECT_MAX_MESSAGES` | `3000` | Queue message limit, 100–10000 |
 | `GEMINI_CONNECT_TIMEOUT_MS` | `5000` | Setup timeout, integer 1–60000 ms |
 | `GEMINI_CLOSE_WAIT_MS` | `1000` | Maximum close-acknowledgement wait, 0–5000 ms; capped by recovery budget |
 | `GEMINI_RETRY_BASE_MS` | `500` | Base resume backoff, 0–5000 ms; exponential delay capped at 2000 ms before jitter and budget caps |
@@ -342,7 +351,9 @@ Optional recovery settings (defaults require no `.env` changes):
 | `GEMINI_CATCHUP_FACTOR_HIGH` | `4` | Drain multiplier at the high threshold |
 | `GEMINI_CATCHUP_MEDIUM_MS` | `500` | Medium queue threshold |
 | `GEMINI_CATCHUP_HIGH_MS` | `2000` | High queue threshold |
-| `GEMINI_MIN_DRAIN_DELAY_MS` | `2` | Minimum interval between queued sends |
+| `GEMINI_MIN_DRAIN_DELAY_MS` | `2` | Minimum interval between queued bursts |
+| `GEMINI_CATCHUP_BURST_TARGET_MS` | `160` | Audio target per burst, 20–1000 ms |
+| `GEMINI_CATCHUP_BURST_MAX_MESSAGES` | `8` | Maximum messages per burst, integer 1–64 |
 
 Factors must be finite, greater than 1, at most 10, and ordered low ≤ medium ≤ high.
 Thresholds must be positive and finite, with medium < high. Minimum drain delay
@@ -377,7 +388,7 @@ Optional environment variables (defaults apply without editing Render settings):
 | `PACER_MAX_WAIT_MS` | `120` | Maximum initial queue wait, also releases partial tails after an input gap |
 | `PACER_END_GAP_MS` | `200` | Silence to bridge before returning to prebuffering |
 | `AGENT_CHUNK_MS` | `20` | Browser mic batching; accepts 20, 40, or 100 |
-| `GEMINI_CHUNK_SAMPLES` | `320` | Gemini input batch size at 16kHz (320 = 20ms) |
+| `GEMINI_CHUNK_SAMPLES` | `640` | Gemini input batch size at 16kHz (640 = 40ms) |
 
 The pacer checks every 20ms, so a timeout is serviced on the next tick; a busy event
 loop can delay it further. Short responses no longer depend on reaching a minimum
