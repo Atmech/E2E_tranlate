@@ -14,14 +14,14 @@ function harness(env = {}) {
   const context = vm.createContext({
     console: { log: (...args) => logs.push(args), warn: (...args) => logs.push(args), error: (...args) => logs.push(args) },
     Buffer, Int16Array, performance: { now: () => time },
-    process: { env: { GEMINI_API_KEY: 'offline-test', GEMINI_CLOSE_WAIT_MS: '0', GEMINI_RETRY_BASE_MS: '0', GEMINI_RETRY_JITTER_MS: '0', ...env } }, int16ToB64, Modality: { AUDIO: 'AUDIO' },
+    process: { env: { GEMINI_API_KEY: 'offline-test', GEMINI_CHUNK_SAMPLES: '320', GEMINI_RECONNECT_BUFFER_SECONDS: '10', GEMINI_CLOSE_WAIT_MS: '0', GEMINI_RETRY_BASE_MS: '0', GEMINI_RETRY_JITTER_MS: '0', ...env } }, int16ToB64, Modality: { AUDIO: 'AUDIO' },
     setTimeout: (fn, ms) => timer(fn, ms), clearTimeout: id => timers.delete(id),
     setInterval: (fn, ms) => timer(fn, ms, true), clearInterval: id => timers.delete(id),
     GoogleGenAI: class { live = { connect: options => new Promise((resolve, reject) => {
       const call = { ...options, sent: [], closed: 0, reject, throwSend: false };
       call.session = {
         sendRealtimeInput(payload) {
-          if (call.throwSend) throw new Error('send failed');
+          if (call.throwSend || call.sent.length === call.failAfter) throw new Error('send failed');
           call.sent.push({ payload, at: time });
         },
         close() { call.closed++; if (!call.deferClose) call.callbacks.onclose({ reason: 'intentional close' }); },
@@ -392,4 +392,80 @@ test('cost summaries retain unsent input on failure and are sampled at most once
   const end=costRecords(h).at(-1);
   assert.equal(end.event,'end');assert.equal(end.failed,true);
   assert.equal(end.inputReceivedMs,60);assert.equal(end.inputSubmittedMs,40);assert.equal(end.queuedInputMs,20);
+});
+
+// Existing recovery cases above retain explicit 20ms/10s overrides for compatibility.
+// These cases exercise the new production defaults and burst failure boundaries.
+const burstDefaults = { GEMINI_CHUNK_SAMPLES: undefined, GEMINI_RECONNECT_BUFFER_SECONDS: undefined };
+const pcm40 = value => new Int16Array(640).fill(value);
+
+test('default chunks combine two 20ms frames and flush a short final frame', async () => {
+  const h = harness({ ...burstDefaults, GEMINI_LIVE_MODEL: 'general-live' }); await h.start();
+  h.t.feed(pcm(1)); assert.equal(h.calls[0].sent.length, 0);
+  h.t.feed(pcm(2));
+  const audio = Buffer.from(h.calls[0].sent[0].payload.audio.data, 'base64');
+  assert.equal(audio.length, 1280);
+  assert.equal(audio.readInt16LE(0), 1); assert.equal(audio.readInt16LE(640), 2);
+  h.t.feed(pcm(3)); h.t.endInput();
+  assert.equal(Buffer.from(h.calls[0].sent[1].payload.audio.data, 'base64').length, 640);
+  assert.equal(h.calls[0].sent[2].payload.audioStreamEnd, true);
+  assert.equal(h.t.getStats().cost.inputSubmittedMs, 60); h.t.close();
+});
+
+test('default reconnect buffer accepts 30 seconds and fails on the next chunk', async () => {
+  const h = harness(burstDefaults); await h.start(); await h.rotate();
+  for (let i = 0; i < 750; i++) h.t.feed(pcm40(i));
+  assert.equal(h.failures.length, 0); assert.equal(h.t.getStats().outboxMs, 30000);
+  h.t.feed(pcm40(750)); await settle();
+  assert.equal(h.failures.length, 1); assert.match(h.failures[0].message, /30s or 3000 messages/);
+  assert.equal(h.timers.size, 0);
+});
+
+test('default bursts pace 160ms at 4x and drain a ten-second backlog with ongoing input', async () => {
+  const h = harness(burstDefaults); await h.start(); await h.rotate();
+  for (let i = 1; i <= 250; i++) h.t.feed(pcm40(i));
+  await h.ready(); assert.equal(h.calls[1].sent.length, 4);
+  await h.tick(39); assert.equal(h.calls[1].sent.length, 4);
+  await h.tick(1); assert.equal(h.calls[1].sent.length, 8);
+  for (let i = 251; i <= 400; i++) { h.t.feed(pcm40(i)); await h.tick(40); }
+  assert.equal(h.failures.length, 0); assert.equal(h.t.getStats().state, 'ready');
+  assert.equal(h.t.getStats().outboxMs, 0); assert.equal(h.t.drainTimer, null);
+  assert.deepEqual(samples(h.calls[1]), Array.from({ length: 400 }, (_, i) => i + 1));
+  assert.equal(h.t.getStats().maxDrainBurstMessages, 4);
+  assert.equal(h.t.getStats().maxDrainBurstMs, 160);
+  assert.equal(h.t.getStats().cost.inputSubmittedMs, 16000); h.t.close();
+});
+
+test('a mid-burst failure replays only unaccepted chunks and counts accepted audio once', async () => {
+  const h = harness(burstDefaults); await h.start(); await h.rotate();
+  for (let i = 1; i <= 6; i++) h.t.feed(pcm40(i));
+  h.calls[1].failAfter = 2; await h.ready(1);
+  assert.deepEqual(samples(h.calls[1]), [1, 2]);
+  assert.equal(h.t.outboxBytes, 4 * 1280);
+  assert.equal(h.t.getStats().cost.inputSubmittedMs, 80);
+  await h.ready(); await h.tick(500);
+  assert.deepEqual(samples(h.calls[2]), [3, 4, 5, 6]);
+  assert.equal(h.t.outboxBytes, 0);
+  assert.equal(h.t.getStats().cost.inputSubmittedMs, 240);
+  assert.equal(h.failures.length, 0); h.t.close(); assert.equal(h.timers.size, 0);
+});
+
+test('burst message cap bounds control-only queues and preserves order', async () => {
+  const h = harness({ ...burstDefaults, GEMINI_CATCHUP_BURST_MAX_MESSAGES: '3' });
+  await h.start(); await h.rotate();
+  for (let i = 0; i < 10; i++) h.t._send({ audioStreamEnd: true, testSequence: i });
+  await h.ready(); assert.equal(h.calls[1].sent.length, 3);
+  await h.tick(1); assert.equal(h.calls[1].sent.length, 3);
+  await h.tick(1); assert.equal(h.calls[1].sent.length, 6);
+  await h.tick(4);
+  assert.deepEqual(h.calls[1].sent.map(x => x.payload.testSequence), Array.from({ length: 10 }, (_, i) => i));
+  assert.equal(h.t.getStats().maxDrainBurstMessages, 3);
+  assert.equal(h.t.getStats().cost.inputSubmittedMs, 0); h.t.close();
+});
+
+test('burst configuration rejects invalid targets and message limits', () => {
+  for (const value of ['19', '1001', 'NaN', 'Infinity'])
+    assert.throws(() => harness({ GEMINI_CATCHUP_BURST_TARGET_MS: value }), /must/);
+  for (const value of ['0', '65', '1.5', 'NaN'])
+    assert.throws(() => harness({ GEMINI_CATCHUP_BURST_MAX_MESSAGES: value }), /must/);
 });

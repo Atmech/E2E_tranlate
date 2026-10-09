@@ -123,7 +123,9 @@ test('translation PTT release flushes real samples then bounded silence then str
   assert.equal(sent[21].audioStreamEnd, true);
   assert.equal(clock.timers.size, 0);
   clock.tick(); assert.equal(sent.length, 22);
+  t.feed(new Int16Array(320)); assert.equal(sent.length, 22);
   t.feed(new Int16Array(320)); assert.equal(sent.length, 23);
+  t.close();
 });
 
 test('new press or audio cancels old silence tail without ending the new input', async () => {
@@ -168,7 +170,9 @@ test('general model still sends pending input directly followed by stream-end', 
   await t.start(); t.feed(new Int16Array(128)); t.endInput();
   assert.equal(Buffer.from(sent[0].audio.data, 'base64').length, 256);
   assert.equal(sent[1].audioStreamEnd, true);
+  t.feed(new Int16Array(320)); assert.equal(sent.length, 2);
   t.feed(new Int16Array(320)); assert.equal(sent.length, 3);
+  t.close();
 });
 
 test('hangup during Gemini connection closes the late session', async () => {

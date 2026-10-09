@@ -13,8 +13,8 @@ const INPUT_TAIL_CHUNKS = 20;
 const INPUT_TAIL_MS = 100;
 const INPUT_SILENCE = new Int16Array(1600); // 100ms at 16kHz; never microphone audio.
 
-// Chunk sent to Gemini. 320 samples = 20ms at 16kHz mono PCM.
-const CHUNK_SAMPLES = Number(process.env.GEMINI_CHUNK_SAMPLES || 320);
+// Chunk sent to Gemini. 640 samples = 40ms at 16kHz mono PCM.
+const CHUNK_SAMPLES = Number(process.env.GEMINI_CHUNK_SAMPLES || 640);
 if (!Number.isInteger(CHUNK_SAMPLES) || CHUNK_SAMPLES < 1 || CHUNK_SAMPLES > 16000) {
   throw new Error('GEMINI_CHUNK_SAMPLES must be an integer between 1 and 16000');
 }
@@ -22,13 +22,13 @@ if (!Number.isInteger(CHUNK_SAMPLES) || CHUNK_SAMPLES < 1 || CHUNK_SAMPLES > 160
 // 16kHz * 2 bytes/sample = 32 bytes/ms.
 const INPUT_BYTES_PER_MS = 32;
 
-const RECONNECT_BUFFER_SECONDS = Number(process.env.GEMINI_RECONNECT_BUFFER_SECONDS || 10);
+const RECONNECT_BUFFER_SECONDS = Number(process.env.GEMINI_RECONNECT_BUFFER_SECONDS || 30);
 if (!Number.isFinite(RECONNECT_BUFFER_SECONDS) || RECONNECT_BUFFER_SECONDS < 1 || RECONNECT_BUFFER_SECONDS > 60) {
   throw new Error('GEMINI_RECONNECT_BUFFER_SECONDS must be between 1 and 60');
 }
 const RECONNECT_BUFFER_BYTES = 16000 * 2 * RECONNECT_BUFFER_SECONDS;
 
-const MAX_OUTBOX_MESSAGES = Number(process.env.GEMINI_RECONNECT_MAX_MESSAGES || 1000);
+const MAX_OUTBOX_MESSAGES = Number(process.env.GEMINI_RECONNECT_MAX_MESSAGES || 3000);
 if (!Number.isInteger(MAX_OUTBOX_MESSAGES) || MAX_OUTBOX_MESSAGES < 100 || MAX_OUTBOX_MESSAGES > 10000) {
   throw new Error('GEMINI_RECONNECT_MAX_MESSAGES must be an integer between 100 and 10000');
 }
@@ -61,6 +61,21 @@ const CATCHUP_FACTOR_HIGH = Number(process.env.GEMINI_CATCHUP_FACTOR_HIGH || 4.0
 const CATCHUP_MEDIUM_MS = Number(process.env.GEMINI_CATCHUP_MEDIUM_MS || 500);
 const CATCHUP_HIGH_MS = Number(process.env.GEMINI_CATCHUP_HIGH_MS || 2000);
 const MIN_DRAIN_DELAY_MS = Number(process.env.GEMINI_MIN_DRAIN_DELAY_MS || 2);
+
+// Catch-up is drained in bounded bursts instead of one message per timer callback.
+// This preserves the configured average catch-up factor while sharply reducing timer
+// pressure when many translator directions reconnect at the same time.
+const CATCHUP_BURST_TARGET_MS = Number(process.env.GEMINI_CATCHUP_BURST_TARGET_MS || 160);
+const CATCHUP_BURST_MAX_MESSAGES = Number(process.env.GEMINI_CATCHUP_BURST_MAX_MESSAGES || 8);
+
+if (!Number.isFinite(CATCHUP_BURST_TARGET_MS) ||
+    CATCHUP_BURST_TARGET_MS < 20 || CATCHUP_BURST_TARGET_MS > 1000) {
+  throw new Error('GEMINI_CATCHUP_BURST_TARGET_MS must be between 20 and 1000 milliseconds');
+}
+if (!Number.isInteger(CATCHUP_BURST_MAX_MESSAGES) ||
+    CATCHUP_BURST_MAX_MESSAGES < 1 || CATCHUP_BURST_MAX_MESSAGES > 64) {
+  throw new Error('GEMINI_CATCHUP_BURST_MAX_MESSAGES must be an integer between 1 and 64');
+}
 
 for (const [name, value] of Object.entries({
   GEMINI_CATCHUP_FACTOR_LOW: CATCHUP_FACTOR_LOW,
@@ -196,6 +211,9 @@ export class Translator {
     this.maxOutboxBytes = 0;
     this.maxOutboxMessages = 0;
     this.maxOutboxMs = 0;
+    this.drainBursts = 0;
+    this.maxDrainBurstMessages = 0;
+    this.maxDrainBurstMs = 0;
   }
 
   _setState(state, details = {}) {
@@ -236,10 +254,9 @@ export class Translator {
     return CATCHUP_FACTOR_LOW;
   }
 
-  _drainDelayMs(itemBytes) {
-    if (!itemBytes) return MIN_DRAIN_DELAY_MS;
-    const audioDurationMs = itemBytes / INPUT_BYTES_PER_MS;
-    const factor = this._catchupFactor();
+  _drainDelayMs(audioBytes, factor = this._catchupFactor()) {
+    if (!audioBytes) return MIN_DRAIN_DELAY_MS;
+    const audioDurationMs = audioBytes / INPUT_BYTES_PER_MS;
     return Math.max(MIN_DRAIN_DELAY_MS, audioDurationMs / factor);
   }
 
@@ -571,6 +588,9 @@ export class Translator {
       maxOutboxMessages: this.maxOutboxMessages,
       maxOutboxBytes: this.maxOutboxBytes,
       maxOutboxMs: Math.round(this.maxOutboxMs),
+      drainBursts: this.drainBursts,
+      maxDrainBurstMessages: this.maxDrainBurstMessages,
+      maxDrainBurstMs: Math.round(this.maxDrainBurstMs),
     });
 
     this.failureRaised = true;
@@ -652,16 +672,49 @@ export class Translator {
   _sendQueued() {
     if (!this.session || !this.outbox.length) return;
 
-    const item = this.outbox[0];
+    const queuedMsAtStart = this._queuedMs();
+    const factor = this._catchupFactor(queuedMsAtStart);
+    const targetBytes = Math.max(
+      CHUNK_SAMPLES * 2,
+      Math.ceil(CATCHUP_BURST_TARGET_MS * INPUT_BYTES_PER_MS),
+    );
 
-    // sendRealtimeInput() is synchronous at this call boundary. Only remove the item after
-    // the SDK accepted the send call; if it throws, the item remains queued for recovery.
-    this.session.sendRealtimeInput(item.payload);
-    this.costSubmittedMs += item.bytes / INPUT_BYTES_PER_MS;
+    let acceptedMessages = 0;
+    let acceptedBytes = 0;
 
-    this.outbox.shift();
-    this.outboxBytes -= item.bytes;
-    if (this.outboxBytes < 0) this.outboxBytes = 0;
+    try {
+      // sendRealtimeInput() is synchronous at this call boundary. Send a bounded amount
+      // of already-buffered audio per callback, then sleep according to the SAME average
+      // catch-up factor. This cuts timer callbacks substantially without hot-looping the SDK.
+      while (
+        acceptedMessages < this.outbox.length &&
+        acceptedMessages < CATCHUP_BURST_MAX_MESSAGES
+      ) {
+        const item = this.outbox[acceptedMessages];
+        this.session.sendRealtimeInput(item.payload);
+        acceptedMessages += 1;
+        acceptedBytes += item.bytes;
+
+        // Zero-byte control messages do not advance the audio-time budget. Keep them bounded
+        // by CATCHUP_BURST_MAX_MESSAGES so a control-message run can never monopolize the loop.
+        if (acceptedBytes >= targetBytes) break;
+      }
+    } finally {
+      // Remove only writes the SDK accepted. If a later item throws, that item and everything
+      // after it remain queued for the replacement connection. One splice per burst also avoids
+      // the repeated Array.shift() work that becomes expensive with large reconnect queues.
+      if (acceptedMessages) {
+        this.outbox.splice(0, acceptedMessages);
+        this.outboxBytes -= acceptedBytes;
+        this.costSubmittedMs += acceptedBytes / INPUT_BYTES_PER_MS;
+        if (this.outboxBytes < 0) this.outboxBytes = 0;
+
+        const burstMs = acceptedBytes / INPUT_BYTES_PER_MS;
+        this.drainBursts += 1;
+        this.maxDrainBurstMessages = Math.max(this.maxDrainBurstMessages, acceptedMessages);
+        this.maxDrainBurstMs = Math.max(this.maxDrainBurstMs, burstMs);
+      }
+    }
 
     // IMPORTANT: if the queue is empty, do not leave a real-time timer running. The next
     // incoming audio can go back to the direct-send fast path immediately.
@@ -670,7 +723,10 @@ export class Translator {
         console.log(
           `${this._tag()} reconnect backlog drained ` +
           `catchupMs=${Math.round(performance.now() - this.catchupStartedAt)} ` +
-          `maxQueuedMs=${Math.round(this.maxOutboxMs)}`,
+          `maxQueuedMs=${Math.round(this.maxOutboxMs)} ` +
+          `drainBursts=${this.drainBursts} ` +
+          `maxBurstMessages=${this.maxDrainBurstMessages} ` +
+          `maxBurstMs=${Math.round(this.maxDrainBurstMs)}`,
         );
       }
       this.catchupStartedAt = null;
@@ -679,9 +735,10 @@ export class Translator {
       return;
     }
 
-    // Drain faster than real time until the queue reaches zero. This prevents the reconnect
-    // backlog from becoming permanent while new real-time audio is still arriving.
-    const delayMs = this._drainDelayMs(item.bytes);
+    // Pace the whole burst at the configured average catch-up factor. With the defaults,
+    // four 40ms chunks (160ms audio) are sent together and a high-backlog 4x catch-up waits
+    // about 40ms before the next burst, instead of scheduling one timer for every chunk.
+    const delayMs = this._drainDelayMs(acceptedBytes, factor);
 
     this.drainTimer = setTimeout(() => {
       this.drainTimer = null;
@@ -920,6 +977,9 @@ export class Translator {
       maxOutboxMessages: this.maxOutboxMessages,
       maxOutboxBytes: this.maxOutboxBytes,
       maxOutboxMs: Math.round(this.maxOutboxMs),
+      drainBursts: this.drainBursts,
+      maxDrainBurstMessages: this.maxDrainBurstMessages,
+      maxDrainBurstMs: Math.round(this.maxDrainBurstMs),
     };
   }
 
