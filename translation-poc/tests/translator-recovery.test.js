@@ -5,7 +5,7 @@ import vm from 'node:vm';
 import { int16ToB64 } from '../bridge/audio.js';
 
 const settle = async () => { for (let i = 0; i < 30; i++) await Promise.resolve(); };
-function harness(env = {}) {
+function harness(env = {}, options = {}) {
   let time = 0, id = 0;
   const timers = new Map(), calls = [], failures = [], logs = [];
   const timer = (fn, ms, repeat = false) => {
@@ -36,7 +36,7 @@ function harness(env = {}) {
   const source = fs.readFileSync(new URL('../bridge/Translator.js', import.meta.url), 'utf8')
     .replace(/^import .*;\n/gm, '').replace('export class Translator', 'class Translator');
   vm.runInContext(source + '\nthis.Translator = Translator;', context);
-  const t = new context.Translator('en', { onFailure: error => failures.push(error) });
+  const t = new context.Translator('en', { onFailure: error => failures.push(error), ...options });
   const tick = async ms => {
     const end = time + ms;
     while (true) {
@@ -59,6 +59,24 @@ function harness(env = {}) {
 }
 const pcm = value => new Int16Array(320).fill(value);
 const samples = call => call.sent.filter(x => x.payload.audio).map(x => Buffer.from(x.payload.audio.data, 'base64').readInt16LE());
+
+test('voice environment selects destination overrides and survives reconnection', async () => {
+  for (const model of ['gemini-3.5-live-translate-preview', 'gemini-3.8-live']) {
+    for (const [direction, expected] of [['caller->agent', 'Aoede'], ['agent->caller', 'Fenrir'], [undefined, 'Kore']]) {
+      const h = harness({ GEMINI_LIVE_MODEL: model, GEMINI_VOICE_NAME: 'Kore',
+        GEMINI_AGENT_VOICE: ' Aoede ', GEMINI_CUSTOMER_VOICE: 'Fenrir' }, { direction });
+      await h.start();
+      assert.equal(h.calls[0].config.speechConfig.voiceConfig.prebuiltVoiceConfig.voiceName, expected);
+      await h.rotate(); await h.ready();
+      assert.equal(h.calls[1].config.speechConfig.voiceConfig.prebuiltVoiceConfig.voiceName, expected);
+      h.t.close();
+    }
+  }
+  const fallback = harness({ GEMINI_VOICE_NAME: 'Aoede', GEMINI_AGENT_VOICE: ' ' }, { direction: 'caller->agent' });
+  assert.equal(fallback.t._config().speechConfig.voiceConfig.prebuiltVoiceConfig.voiceName, 'Aoede');
+  const defaults = harness();
+  assert.equal(defaults.t._config().speechConfig, undefined);
+});
 
 test('setup acceptance gates audio; configuration retains translation and enables long sessions', async () => {
   const h = harness(); const starting = h.t.start();

@@ -90,6 +90,14 @@ mixed audio automatically.
 
 ## DigitalOcean deployment and call test
 
+Optional voice environment variables: `GEMINI_AGENT_VOICE=Aoede` sets the voice
+the agent hears (caller->agent), and `GEMINI_CUSTOMER_VOICE=Fenrir` sets the voice
+the customer hears (agent->caller). `GEMINI_VOICE_NAME` supplies a fallback for
+both directions. Blank values preserve the model default. Names are case-sensitive
+and must be supported by the configured Gemini model. These settings also apply
+to the browser-agent demo. Redeploy/restart after changing environment variables;
+the new settings apply to new translation sessions.
+
 Deploy this code with `MEDIA_MODE=translation` and the existing Gemini API key/model.
 Use **one running app instance**: pairing is stored in process memory. Multiple
 instances or a rolling deployment can split the two sockets; wait until deployment
