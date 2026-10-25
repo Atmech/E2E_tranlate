@@ -185,7 +185,7 @@ export class Translator {
     direction,
   } = {}) {
     this.targetLang = targetLang;
-    this.sourceLang = sourceLang || null;
+    this.sourceLang = sourceLang === 'auto' ? null : sourceLang || null;
     const destinationVoice = direction === 'caller->agent'
       ? process.env.GEMINI_AGENT_VOICE
       : direction === 'agent->caller' ? process.env.GEMINI_CUSTOMER_VOICE : '';
@@ -399,10 +399,12 @@ export class Translator {
       };
     } else {
       config.realtimeInputConfig = { activityHandling: 'NO_INTERRUPTION' };
-      const from = this.sourceLang ? `from ${langName(this.sourceLang)} ` : '';
+      const sourceInstruction = this.sourceLang
+        ? `The speaker talks from ${langName(this.sourceLang)} and you translate every utterance into ${langName(this.targetLang)}.`
+        : `Automatically detect the language of each incoming utterance, including when the speaker changes languages, and translate every utterance into ${langName(this.targetLang)}.`;
       config.systemInstruction = {
         parts: [{
-          text: `You are a simultaneous interpreter. The speaker talks ${from}and you translate every utterance into ${langName(this.targetLang)}. Speak only the ${langName(this.targetLang)} translation — no commentary, no repetition of the source, never switch to any other language.`,
+          text: `You are a simultaneous interpreter. ${sourceInstruction} Speak only the ${langName(this.targetLang)} translation — no commentary, no repetition of the source, never switch to any other language.`,
         }],
       };
     }

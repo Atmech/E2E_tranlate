@@ -85,9 +85,49 @@ for (const firstRole of ['caller', 'agent']) test(`pair ${firstRole} first; tran
   assert.equal(agent.sent.length, 1, 'late model output ignored after hangup');
 });
 
+for (const firstRole of ['caller', 'agent']) {
+  for (const autoRoles of [['caller'], ['agent'], ['caller', 'agent']]) {
+    test(`auto source ${autoRoles.join('+')}, ${firstRole} first: fixed targets and routing`, async t => {
+      const h = harness(t);
+      const sockets = {};
+      for (const role of [firstRole, firstRole === 'caller' ? 'agent' : 'caller']) {
+        sockets[role] = h.connect(role, {
+          SOURCE_LANG: autoRoles.includes(role) ? 'auto' : role === 'caller' ? 'hi' : 'ar',
+          TARGET_LANG: role === 'caller' ? 'ar' : 'hi',
+        });
+      }
+      await settle();
+      assert.equal(h.session().ready, true);
+      for (const role of ['caller', 'agent']) {
+        const translator = h.translators.find(tr => tr.callbacks.direction === `${role}->${role === 'caller' ? 'agent' : 'caller'}`);
+        assert.equal(translator.targetLang, role === 'caller' ? 'ar' : 'hi');
+        assert.equal(translator.callbacks.sourceLang, autoRoles.includes(role) ? 'auto' : role === 'caller' ? 'hi' : 'ar');
+        output(translator, 1200);
+        h.session().legs.get(role === 'caller' ? 'agent' : 'caller').pacer._tick();
+      }
+      assert.equal(sockets.caller.sent.length, 1);
+      assert.equal(sockets.agent.sent.length, 1);
+    });
+  }
+  test(`auto source preserves known language mismatch validation, ${firstRole} first`, t => {
+    const h = harness(t);
+    const metadata = {
+      caller: { SOURCE_LANG: 'auto', TARGET_LANG: 'ar' },
+      agent: { SOURCE_LANG: 'en', TARGET_LANG: 'hi' },
+    };
+    const first = h.connect(firstRole, metadata[firstRole]);
+    const other = firstRole === 'caller' ? 'agent' : 'caller';
+    assert.equal(h.connect(other, metadata[other]).closeCode, 1008);
+    assert.equal(first.readyState, 1);
+    assert.equal(h.translators.length, 0);
+  });
+}
+
 test('missing metadata is rejected; duplicate role and wrong languages preserve valid peer', async t => {
   const h = harness(t);
-  for (const overrides of [{ CALL_ID: '' }, { ROLE: 'other' }, { SOURCE_LANG: '' }, { TARGET_LANG: undefined }]) {
+  for (const overrides of [{ CALL_ID: '' }, { ROLE: 'other' }, { SOURCE_LANG: '' },
+    { SOURCE_LANG: undefined }, { SOURCE_LANG: 'AUTO' }, { TARGET_LANG: 'auto' },
+    { TARGET_LANG: '' }, { TARGET_LANG: undefined }]) {
     assert.equal(h.connect('caller', overrides).closeCode, 1008);
     assert.equal(h.activeCalls.size, 0);
   }

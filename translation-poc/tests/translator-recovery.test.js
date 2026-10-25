@@ -60,6 +60,27 @@ function harness(env = {}, options = {}) {
 const pcm = value => new Int16Array(320).fill(value);
 const samples = call => call.sent.filter(x => x.payload.audio).map(x => Buffer.from(x.payload.audio.data, 'base64').readInt16LE());
 
+test('auto source keeps explicit target and auto-detection config across reconnects', async () => {
+  for (const model of ['gemini-3.5-live-translate-preview', 'gemini-3.8-live']) {
+    const h = harness({ GEMINI_LIVE_MODEL: model }, { sourceLang: 'auto' });
+    await h.start();
+    await h.rotate(); await h.ready();
+    assert.equal(h.t.sourceLang, null);
+    for (const call of h.calls) {
+      if (model.includes('translate')) {
+        assert.equal(call.config.translationConfig.targetLanguageCode, 'en');
+        assert.equal(call.config.systemInstruction, undefined);
+      } else {
+        assert.match(call.config.systemInstruction.parts[0].text, /Automatically detect the language of each incoming utterance/);
+        assert.match(call.config.systemInstruction.parts[0].text, /Speak only the English translation/);
+      }
+    }
+    h.t.close();
+  }
+  const explicit = harness({ GEMINI_LIVE_MODEL: 'gemini-3.8-live' }, { sourceLang: 'hi' });
+  assert.match(explicit.t._config().systemInstruction.parts[0].text, /from Hindi/);
+});
+
 test('voice environment selects destination overrides and survives reconnection', async () => {
   for (const model of ['gemini-3.5-live-translate-preview', 'gemini-3.8-live']) {
     for (const [direction, expected] of [['caller->agent', 'Aoede'], ['agent->caller', 'Fenrir'], [undefined, 'Kore']]) {

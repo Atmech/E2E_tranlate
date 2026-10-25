@@ -66,8 +66,10 @@ Agent uses the same event format, with:
 - Use a unique `CALL_ID` for each phone conversation, identical on its two sockets.
   Allowed characters: letters, digits, underscore, dot, colon and hyphen; 1–128 characters.
   `connection_id` is transport metadata, not the pairing key.
-- Roles must be exactly `caller` and `agent`. Languages must be reciprocal, as above.
-  Language codes must be supported by the configured model.
+- Roles must be exactly `caller` and `agent`. Explicit source languages must match
+  the opposite leg's target, as above. `SOURCE_LANG` also accepts exact lowercase
+  `auto`; that source comparison is skipped, while known language mismatches are
+  still rejected. Language codes must be supported by the configured model.
 - Either participant can connect first. The backend waits up to 30 seconds for the
   other, then up to 30 seconds for both translators to start.
 - Audio arriving before `translation ready` is dropped and counted at hangup.
@@ -87,6 +89,35 @@ Rajiv bhai's Asterisk routing must send each participant's microphone separately
 play returned audio only to that participant, and exclude translated playback from
 microphone input. Pairing in Node does not configure Asterisk bridges or isolate
 mixed audio automatically.
+
+### Automatic source language detection
+
+Set `SOURCE_LANG=auto` on either or both legs. Keep `TARGET_LANG` explicit: it is
+the translation output language for that leg's microphone, heard by the opposite
+participant. Blank/missing languages and `TARGET_LANG=auto` are rejected.
+
+For a caller speaking an automatically detected language, an Arabic-speaking
+agent, and replies translated into Hindi, send these `channel_variables`:
+
+```json
+{"CALL_ID":"abc123","ROLE":"caller","SOURCE_LANG":"auto","TARGET_LANG":"ar"}
+```
+
+```json
+{"CALL_ID":"abc123","ROLE":"agent","SOURCE_LANG":"ar","TARGET_LANG":"hi"}
+```
+
+The agent source can also be `auto`, with the same explicit targets. The backend
+does not discover the return target from caller speech. Asterisk must supply the
+caller's listening language in the agent leg's `TARGET_LANG`.
+
+Auto source is delegated to Gemini: dedicated Translate models receive the fixed
+target without a source constraint; general Live models receive an instruction to
+detect each incoming utterance's language and translate only into the fixed target.
+Recognition quality and supported languages depend on the configured model. The
+monitor displays `Auto-detect`; this is the requested mode, not a confirmed detected
+language. Verify Hindi/English speech to Arabic and Arabic replies to Hindi on a
+live call before production rollout. No additional environment variable is needed.
 
 ## DigitalOcean deployment and call test
 
