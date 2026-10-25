@@ -186,6 +186,10 @@ export class Translator {
   } = {}) {
     this.targetLang = targetLang;
     this.sourceLang = sourceLang || null;
+    const destinationVoice = direction === 'caller->agent'
+      ? process.env.GEMINI_AGENT_VOICE
+      : direction === 'agent->caller' ? process.env.GEMINI_CUSTOMER_VOICE : '';
+    this.voiceName = destinationVoice?.trim() || process.env.GEMINI_VOICE_NAME?.trim() || '';
     this.onAudio = onAudio || (() => {});
     this.onInputText = onInputText || (() => {});
     this.onOutputText = onOutputText || (() => {});
@@ -382,6 +386,11 @@ export class Translator {
       sessionResumption: handle ? { handle } : {},
       contextWindowCompression: { slidingWindow: {} },
     };
+    if (this.voiceName) {
+      config.speechConfig = {
+        voiceConfig: { prebuiltVoiceConfig: { voiceName: this.voiceName } },
+      };
+    }
 
     if (isTranslate) {
       config.translationConfig = {
