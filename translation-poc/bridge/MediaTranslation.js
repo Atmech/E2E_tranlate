@@ -9,7 +9,8 @@ export function readMediaMetadata(variables) {
     throw new Error('Missing or invalid channel_variables.CALL_ID');
   if (!['caller', 'agent'].includes(ROLE))
     throw new Error('channel_variables.ROLE must be caller or agent');
-  for (const value of [SOURCE_LANG, TARGET_LANG]) {
+  for (const [field, value] of [['SOURCE_LANG', SOURCE_LANG], ['TARGET_LANG', TARGET_LANG]]) {
+    if (field === 'SOURCE_LANG' && value === 'auto') continue;
     if (typeof value !== 'string' || !/^[a-z]{2,3}(?:-[A-Za-z0-9]{2,8})*$/.test(value))
       throw new Error('Missing or invalid SOURCE_LANG / TARGET_LANG');
   }
@@ -48,7 +49,8 @@ export class CallTranslationSession {
     if (this.closed || callId !== this.callId) throw new Error('Call session unavailable');
     if (this.legs.has(role)) throw new Error(`Duplicate role ${role}`);
     const peer = this.legs.get(opposite(role));
-    if (peer && (peer.sourceLang !== targetLang || peer.targetLang !== sourceLang))
+    if (peer && ((peer.sourceLang !== 'auto' && peer.sourceLang !== targetLang)
+      || (sourceLang !== 'auto' && peer.targetLang !== sourceLang)))
       throw new Error('Caller and agent languages must be reciprocal');
     pacer.label = `${callId} ${opposite(role)}->${role}`;
     this.legs.set(role, { sourceLang, targetLang, sock, pacer, droppedBytes: 0 });

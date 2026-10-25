@@ -8,6 +8,7 @@ let detailTab = 'conversation';
 let detailSignature = '';
 const languages = new Intl.DisplayNames(['en'], { type: 'language' });
 const language = code => {
+  if (code === 'auto') return 'Auto-detect';
   if (!code) return '—';
   try { return languages.of(code) || code; } catch { return code; }
 };
